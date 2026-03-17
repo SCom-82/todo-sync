@@ -31,13 +31,13 @@ class MSGraphToDoClient:
         return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
     async def _request(
-        self, method: str, url: str, json: dict | None = None, params: dict | None = None
+        self, method: str, url: str, json_body: dict | None = None, params: dict | None = None
     ) -> dict[str, Any]:
         client = await self._get_client()
         headers = await self._headers()
 
         for attempt in range(MAX_RETRIES):
-            response = await client.request(method, url, headers=headers, json=json, params=params)
+            response = await client.request(method, url, headers=headers, json=json_body, params=params)
 
             if response.status_code == 429:
                 retry_after = int(response.headers.get("Retry-After", 5))
@@ -86,10 +86,10 @@ class MSGraphToDoClient:
         return result.get("value", [])
 
     async def create_list(self, display_name: str) -> dict:
-        return await self._request("POST", f"{BASE_URL}/lists", json={"displayName": display_name})
+        return await self._request("POST", f"{BASE_URL}/lists", json_body={"displayName": display_name})
 
     async def update_list(self, list_ms_id: str, display_name: str) -> dict:
-        return await self._request("PATCH", f"{BASE_URL}/lists/{list_ms_id}", json={"displayName": display_name})
+        return await self._request("PATCH", f"{BASE_URL}/lists/{list_ms_id}", json_body={"displayName": display_name})
 
     async def delete_list(self, list_ms_id: str) -> None:
         await self._request("DELETE", f"{BASE_URL}/lists/{list_ms_id}")
@@ -119,10 +119,10 @@ class MSGraphToDoClient:
         return all_tasks
 
     async def create_task(self, list_ms_id: str, task_data: dict) -> dict:
-        return await self._request("POST", f"{BASE_URL}/lists/{list_ms_id}/tasks", json=task_data)
+        return await self._request("POST", f"{BASE_URL}/lists/{list_ms_id}/tasks", json_body=task_data)
 
     async def update_task(self, list_ms_id: str, task_ms_id: str, task_data: dict) -> dict:
-        return await self._request("PATCH", f"{BASE_URL}/lists/{list_ms_id}/tasks/{task_ms_id}", json=task_data)
+        return await self._request("PATCH", f"{BASE_URL}/lists/{list_ms_id}/tasks/{task_ms_id}", json_body=task_data)
 
     async def delete_task(self, list_ms_id: str, task_ms_id: str) -> None:
         await self._request("DELETE", f"{BASE_URL}/lists/{list_ms_id}/tasks/{task_ms_id}")
