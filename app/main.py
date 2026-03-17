@@ -2,6 +2,7 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app.api.router import api_router
 from app.config import settings
@@ -27,7 +28,16 @@ app = FastAPI(
     description="Bidirectional sync: Microsoft To Do ↔ PostgreSQL",
     version="0.1.0",
     lifespan=lifespan,
+    root_path_in_servers=False,
 )
+
+
+@app.middleware("http")
+async def force_https_scheme(request, call_next):
+    """Trust X-Forwarded-Proto from Traefik to fix Swagger UI mixed content."""
+    if request.headers.get("x-forwarded-proto") == "https":
+        request.scope["scheme"] = "https"
+    return await call_next(request)
 
 app.include_router(api_router, prefix=settings.api_prefix)
 
