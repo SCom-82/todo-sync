@@ -72,7 +72,7 @@ class MSGraphToDoClient:
         await self._request("DELETE", f"{BASE_URL}/lists/{list_ms_id}")
 
     async def get_lists_delta(self, delta_link: str | None = None) -> dict:
-        url = delta_link or f"{BASE_URL}/lists/delta?$top=20"
+        url = delta_link or f"{BASE_URL}/lists/delta"
         all_values = []
         result = {}
         while url:
@@ -105,7 +105,7 @@ class MSGraphToDoClient:
         await self._request("DELETE", f"{BASE_URL}/lists/{list_ms_id}/tasks/{task_ms_id}")
 
     async def get_tasks_delta(self, list_ms_id: str, delta_link: str | None = None) -> dict:
-        url = delta_link or f"{BASE_URL}/lists/{list_ms_id}/tasks/delta?$top=20"
+        url = delta_link or f"{BASE_URL}/lists/{list_ms_id}/tasks/delta"
         all_values = []
         result = {}
         while url:

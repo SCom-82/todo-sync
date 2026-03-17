@@ -136,6 +136,13 @@ async def pull_tasks_for_list(db: AsyncSession, task_list: TaskList) -> tuple[in
         logger.warning("Tasks delta link expired for list %s, doing full pull", task_list.ms_id)
         state.delta_link = None
         delta_result = await graph_client.get_tasks_delta(task_list.ms_id, None)
+    except Exception as e:
+        if "400" in str(e) and state.delta_link:
+            logger.warning("Bad delta link for list %s, resetting and retrying", task_list.ms_id)
+            state.delta_link = None
+            delta_result = await graph_client.get_tasks_delta(task_list.ms_id, None)
+        else:
+            raise
 
     upserted = 0
     deleted = 0
