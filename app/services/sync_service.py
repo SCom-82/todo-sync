@@ -303,64 +303,70 @@ async def run_sync(sync_type: str = "delta") -> dict:
     total_deleted = 0
     total_errors = 0
 
-    async with async_session() as db:
-        try:
-            # Pull lists
+    try:
+        # Pull lists (own session)
+        async with async_session() as db:
             lists_upserted, lists_deleted = await pull_lists(db)
             total_pulled += lists_upserted
             total_deleted += lists_deleted
             await db.commit()
 
-            # Pull tasks for each list (commit after each list)
+        # Get list of (id, ms_id) for iteration
+        async with async_session() as db:
             result = await db.execute(
-                select(TaskList).where(TaskList.deleted_at.is_(None), TaskList.ms_id.is_not(None))
+                select(TaskList.id, TaskList.ms_id).where(
+                    TaskList.deleted_at.is_(None), TaskList.ms_id.is_not(None)
+                )
             )
-            task_lists = list(result.scalars().all())
-            for task_list in task_lists:
-                try:
+            list_refs = [(row.id, row.ms_id) for row in result.all()]
+
+        # Pull tasks for each list (separate session per list)
+        for list_id, list_ms_id in list_refs:
+            try:
+                async with async_session() as db:
+                    result = await db.execute(select(TaskList).where(TaskList.id == list_id))
+                    task_list = result.scalar_one()
                     tasks_upserted, tasks_deleted = await pull_tasks_for_list(db, task_list)
                     total_pulled += tasks_upserted
                     total_deleted += tasks_deleted
                     await db.commit()
-                except Exception:
-                    logger.exception("Failed to pull tasks for list %s", task_list.ms_id)
-                    await db.rollback()
-                    total_errors += 1
+            except Exception:
+                logger.exception("Failed to pull tasks for list %s", list_ms_id)
+                total_errors += 1
 
-            # Push pending changes
+        # Push pending changes (own session)
+        async with async_session() as db:
             pushed_lists, pushed_tasks = await push_pending(db)
             total_pushed += pushed_lists + pushed_tasks
             await db.commit()
 
-            duration_ms = int((time.monotonic() - start) * 1000)
-            # Log the sync
-            async with async_session() as log_db:
-                await _log_sync(
-                    log_db, sync_type, "all",
-                    pulled=total_pulled, pushed=total_pushed,
-                    deleted=total_deleted, errors=total_errors,
-                    duration_ms=duration_ms,
-                )
-                await log_db.commit()
-
-            logger.info(
-                "Sync completed: pulled=%d pushed=%d deleted=%d errors=%d duration=%dms",
-                total_pulled, total_pushed, total_deleted, total_errors, duration_ms,
+        duration_ms = int((time.monotonic() - start) * 1000)
+        async with async_session() as log_db:
+            await _log_sync(
+                log_db, sync_type, "all",
+                pulled=total_pulled, pushed=total_pushed,
+                deleted=total_deleted, errors=total_errors,
+                duration_ms=duration_ms,
             )
+            await log_db.commit()
 
-            return {
-                "pulled": total_pulled,
-                "pushed": total_pushed,
-                "deleted": total_deleted,
-                "errors": total_errors,
-                "duration_ms": duration_ms,
-            }
+        logger.info(
+            "Sync completed: pulled=%d pushed=%d deleted=%d errors=%d duration=%dms",
+            total_pulled, total_pushed, total_deleted, total_errors, duration_ms,
+        )
 
-        except Exception:
-            logger.exception("Sync failed")
-            await db.rollback()
-            duration_ms = int((time.monotonic() - start) * 1000)
-            async with async_session() as log_db:
-                await _log_sync(log_db, sync_type, "all", errors=1, duration_ms=duration_ms)
-                await log_db.commit()
-            raise
+        return {
+            "pulled": total_pulled,
+            "pushed": total_pushed,
+            "deleted": total_deleted,
+            "errors": total_errors,
+            "duration_ms": duration_ms,
+        }
+
+    except Exception:
+        logger.exception("Sync failed")
+        duration_ms = int((time.monotonic() - start) * 1000)
+        async with async_session() as log_db:
+            await _log_sync(log_db, sync_type, "all", errors=1, duration_ms=duration_ms)
+            await log_db.commit()
+        raise
