@@ -13,6 +13,7 @@ dependencies = [
     "msal>=1.31",
     "apscheduler>=3.11,<4",
     "pydantic-settings>=2.7",
+    "psycopg2-binary>=2.9",
 ]
 
 [project.optional-dependencies]
