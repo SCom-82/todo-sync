@@ -89,7 +89,7 @@ class SyncState(Base):
     __tablename__ = "sync_state"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    resource_type: Mapped[str] = mapped_column(String(50), unique=True, nullable=False)
+    resource_type: Mapped[str] = mapped_column(String(500), unique=True, nullable=False)
     delta_link: Mapped[str | None] = mapped_column(Text, nullable=True)
     last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_sync_status: Mapped[str] = mapped_column(String(20), default="success")
