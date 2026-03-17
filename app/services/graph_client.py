@@ -54,14 +54,27 @@ class MSGraphToDoClient:
             try:
                 return response.json()
             except Exception as e:
+                # Try cleaning the response text and parsing again
+                import json
+                text = response.text
                 logger.warning(
-                    "Failed to parse JSON (len=%d, attempt %d/%d): %s",
-                    len(response.content), attempt + 1, MAX_RETRIES, e,
+                    "Failed to parse JSON (len=%d, attempt %d/%d): %s. Trying cleanup...",
+                    len(text), attempt + 1, MAX_RETRIES, e,
                 )
+                try:
+                    # Remove null bytes and other control characters
+                    cleaned = text.replace("\x00", "").encode("utf-8", errors="replace").decode("utf-8")
+                    return json.loads(cleaned)
+                except Exception:
+                    pass
                 if attempt < MAX_RETRIES - 1:
                     import asyncio
                     await asyncio.sleep(2)
                     continue
+                # Last resort: log the problematic area and raise
+                pos = 82450
+                if len(text) > pos:
+                    logger.error("JSON around error position: ...%s...", repr(text[pos-50:pos+50]))
                 raise
 
         raise RuntimeError("Max retries exceeded for Graph API request")
