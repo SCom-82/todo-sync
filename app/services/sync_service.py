@@ -20,14 +20,27 @@ def _parse_datetime(value: str | None) -> datetime | None:
 
 
 def _parse_date(dt_obj: dict | None):
+    """Parse dateTimeTimeZone from Graph API into a date in user's timezone.
+
+    Graph API returns dueDateTime as UTC (e.g. 2026-03-16T20:00:00 UTC = 2026-03-17 00:00 Samara).
+    We convert to user timezone before extracting date to avoid -1 day shift.
+    """
     if not dt_obj:
         return None, "UTC"
-    from datetime import date as date_type
     raw = dt_obj.get("dateTime", "")
     tz = dt_obj.get("timeZone", "UTC")
-    if raw:
-        return datetime.fromisoformat(raw.replace("Z", "+00:00")).date(), tz
-    return None, tz
+    if not raw:
+        return None, tz
+    from zoneinfo import ZoneInfo
+    from app.config import settings
+    dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    # If naive datetime, assume UTC (Graph API sends UTC)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    # Convert to user timezone to get the correct date
+    user_tz = ZoneInfo(settings.user_timezone)
+    dt_local = dt.astimezone(user_tz)
+    return dt_local.date(), tz
 
 
 async def _get_or_create_sync_state(db: AsyncSession, resource_type: str) -> SyncState:

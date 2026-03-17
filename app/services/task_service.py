@@ -2,12 +2,19 @@ import asyncio
 import logging
 import uuid
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.models import Task, TaskList
 from app.schemas import TaskCreate, TaskUpdate
+
+
+def _today() -> date:
+    """Get today's date in user's timezone (not UTC)."""
+    return datetime.now(ZoneInfo(settings.user_timezone)).date()
 from app.services.graph_client import graph_client
 
 logger = logging.getLogger(__name__)
@@ -145,7 +152,7 @@ async def get_tasks(
     if importance:
         q = q.where(Task.importance == importance)
     if overdue:
-        q = q.where(and_(Task.due_date < date.today(), Task.status != "completed"))
+        q = q.where(and_(Task.due_date < _today(), Task.status != "completed"))
     if due_before:
         q = q.where(Task.due_date <= due_before)
     if due_after:
@@ -259,7 +266,7 @@ async def delete_task(db: AsyncSession, task_id: uuid.UUID) -> bool:
 # --- Stats ---
 
 async def get_stats(db: AsyncSession) -> dict:
-    today = date.today()
+    today = _today()
     week_end = today + timedelta(days=7)
 
     result = await db.execute(
@@ -321,7 +328,7 @@ async def get_overdue_tasks(db: AsyncSession) -> list[Task]:
     result = await db.execute(
         select(Task).where(
             Task.deleted_at.is_(None),
-            Task.due_date < date.today(),
+            Task.due_date < _today(),
             Task.status != "completed",
         ).order_by(Task.due_date)
     )

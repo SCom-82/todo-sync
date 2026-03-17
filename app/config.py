@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     api_prefix: str = "/api/v1"
     api_key: str = ""
+    user_timezone: str = "Europe/Samara"
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
