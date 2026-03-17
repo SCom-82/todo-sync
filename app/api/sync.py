@@ -16,6 +16,15 @@ async def trigger_sync():
     return result
 
 
+@router.post("/reset")
+async def reset_sync(db: AsyncSession = Depends(get_db)):
+    """Reset all delta links to force a full resync."""
+    from sqlalchemy import update
+    await db.execute(update(SyncState).values(delta_link=None))
+    await db.commit()
+    return {"message": "Delta links reset. Next sync will do a full pull."}
+
+
 @router.get("/status", response_model=SyncStatusResponse)
 async def get_sync_status(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(SyncState).order_by(SyncState.last_sync_at.desc()))

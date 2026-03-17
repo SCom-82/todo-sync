@@ -162,7 +162,10 @@ async def pull_tasks_for_list(db: AsyncSession, task_list: TaskList) -> tuple[in
         existing = result.scalar_one_or_none()
         ms_modified = _parse_datetime(item.get("lastModifiedDateTime"))
 
-        due_date, due_tz = _parse_date(item.get("dueDateTime"))
+        raw_due = item.get("dueDateTime")
+        if raw_due:
+            logger.info("RAW dueDateTime for '%s': %s", item.get("title", "?")[:50], raw_due)
+        due_date, due_tz = _parse_date(raw_due)
         reminder_dt_raw = item.get("reminderDateTime")
         reminder_dt = None
         if reminder_dt_raw and isinstance(reminder_dt_raw, dict):
