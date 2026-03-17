@@ -17,7 +17,10 @@ class MSGraphToDoClient:
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(timeout=60.0, limits=httpx.Limits(max_connections=10))
+            self._client = httpx.AsyncClient(
+                timeout=httpx.Timeout(30.0, read=120.0),
+                limits=httpx.Limits(max_connections=10),
+            )
         return self._client
 
     async def _headers(self) -> dict[str, str]:
@@ -51,7 +54,14 @@ class MSGraphToDoClient:
             try:
                 return response.json()
             except Exception as e:
-                logger.error("Failed to parse JSON response (len=%d): %s", len(response.content), e)
+                logger.warning(
+                    "Failed to parse JSON (len=%d, attempt %d/%d): %s",
+                    len(response.content), attempt + 1, MAX_RETRIES, e,
+                )
+                if attempt < MAX_RETRIES - 1:
+                    import asyncio
+                    await asyncio.sleep(2)
+                    continue
                 raise
 
         raise RuntimeError("Max retries exceeded for Graph API request")
