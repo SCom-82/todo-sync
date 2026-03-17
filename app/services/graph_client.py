@@ -1,3 +1,4 @@
+import json
 import logging
 from typing import Any
 
@@ -54,27 +55,26 @@ class MSGraphToDoClient:
             try:
                 return response.json()
             except Exception as e:
-                # Try cleaning the response text and parsing again
-                import json
-                text = response.text
+                raw = response.content
                 logger.warning(
-                    "Failed to parse JSON (len=%d, attempt %d/%d): %s. Trying cleanup...",
-                    len(text), attempt + 1, MAX_RETRIES, e,
+                    "JSON parse failed (len=%d, attempt %d/%d): %s",
+                    len(raw), attempt + 1, MAX_RETRIES, e,
                 )
+                # Try decoding with error replacement
                 try:
-                    # Remove null bytes and other control characters
-                    cleaned = text.replace("\x00", "").encode("utf-8", errors="replace").decode("utf-8")
-                    return json.loads(cleaned)
-                except Exception:
-                    pass
+                    text = raw.decode("utf-8", errors="replace")
+                    # Remove null bytes
+                    text = text.replace("\x00", "")
+                    return json.loads(text)
+                except json.JSONDecodeError as e2:
+                    # Log area around error for diagnosis
+                    pos = e2.pos or 0
+                    snippet = text[max(0, pos - 100):pos + 100] if pos else ""
+                    logger.error("JSON error at pos %d: %s | snippet: %s", pos, e2, repr(snippet))
                 if attempt < MAX_RETRIES - 1:
                     import asyncio
                     await asyncio.sleep(2)
                     continue
-                # Last resort: log the problematic area and raise
-                pos = 82450
-                if len(text) > pos:
-                    logger.error("JSON around error position: ...%s...", repr(text[pos-50:pos+50]))
                 raise
 
         raise RuntimeError("Max retries exceeded for Graph API request")
