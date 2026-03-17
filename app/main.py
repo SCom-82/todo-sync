@@ -2,7 +2,7 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
-from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.responses import JSONResponse
 
 from app.api.router import api_router
 from app.config import settings
@@ -32,11 +32,21 @@ app = FastAPI(
 )
 
 
+PUBLIC_PATHS = {"/api/v1/healthz", "/api/v1/readyz", "/docs", "/openapi.json", "/redoc"}
+
+
 @app.middleware("http")
-async def force_https_scheme(request, call_next):
-    """Trust X-Forwarded-Proto from Traefik to fix Swagger UI mixed content."""
+async def auth_and_https_middleware(request, call_next):
+    # Trust X-Forwarded-Proto from Traefik
     if request.headers.get("x-forwarded-proto") == "https":
         request.scope["scheme"] = "https"
+
+    # API key check
+    if settings.api_key and request.url.path not in PUBLIC_PATHS:
+        api_key = request.headers.get("x-api-key") or request.query_params.get("api_key")
+        if api_key != settings.api_key:
+            return JSONResponse(status_code=401, content={"detail": "Invalid or missing API key"})
+
     return await call_next(request)
 
 app.include_router(api_router, prefix=settings.api_prefix)

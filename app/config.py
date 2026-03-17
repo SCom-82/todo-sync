@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     sync_interval_seconds: int = 300
     log_level: str = "INFO"
     api_prefix: str = "/api/v1"
+    api_key: str = ""
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
