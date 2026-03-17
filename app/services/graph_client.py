@@ -12,6 +12,18 @@ BASE_URL = "https://graph.microsoft.com/v1.0/me/todo"
 MAX_RETRIES = 3
 
 
+def _try_parse_truncated_json(text: str) -> dict | None:
+    """Try to parse JSON that may have trailing garbage after the valid object."""
+    # Find the position of the last '}' which should close the root object
+    for end_pos in range(len(text), 0, -1):
+        if text[end_pos - 1] == "}":
+            try:
+                return json.loads(text[:end_pos])
+            except json.JSONDecodeError:
+                continue
+    return None
+
+
 class MSGraphToDoClient:
     def __init__(self) -> None:
         self._client: httpx.AsyncClient | None = None
@@ -60,17 +72,13 @@ class MSGraphToDoClient:
                     "JSON parse failed (len=%d, attempt %d/%d): %s",
                     len(raw), attempt + 1, MAX_RETRIES, e,
                 )
-                # Try decoding with error replacement
-                try:
-                    text = raw.decode("utf-8", errors="replace")
-                    # Remove null bytes
-                    text = text.replace("\x00", "")
-                    return json.loads(text)
-                except json.JSONDecodeError as e2:
-                    # Log area around error for diagnosis
-                    pos = e2.pos or 0
-                    snippet = text[max(0, pos - 100):pos + 100] if pos else ""
-                    logger.error("JSON error at pos %d: %s | snippet: %s", pos, e2, repr(snippet))
+                # Graph API sometimes appends extra data after valid JSON.
+                # Try to find the last valid closing brace and parse up to it.
+                text = raw.decode("utf-8", errors="replace")
+                result = _try_parse_truncated_json(text)
+                if result is not None:
+                    logger.info("Recovered truncated JSON (used %d of %d chars)", len(text), len(raw))
+                    return result
                 if attempt < MAX_RETRIES - 1:
                     import asyncio
                     await asyncio.sleep(2)
