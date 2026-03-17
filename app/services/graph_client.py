@@ -13,14 +13,29 @@ MAX_RETRIES = 3
 
 
 def _try_parse_truncated_json(text: str) -> dict | None:
-    """Try to parse JSON that may have trailing garbage after the valid object."""
-    # Find the position of the last '}' which should close the root object
-    for end_pos in range(len(text), 0, -1):
-        if text[end_pos - 1] == "}":
-            try:
-                return json.loads(text[:end_pos])
-            except json.JSONDecodeError:
-                continue
+    """Try to parse JSON that may have trailing garbage or be truncated.
+
+    Strategy: use json.raw_decode which stops at the end of the first
+    valid JSON object, ignoring trailing garbage.
+    """
+    decoder = json.JSONDecoder()
+    try:
+        result, end_idx = decoder.raw_decode(text)
+        if isinstance(result, dict):
+            logger.info("raw_decode recovered JSON: used %d of %d chars", end_idx, len(text))
+            return result
+    except json.JSONDecodeError:
+        pass
+    # Fallback: try to find the closing of the @odata response pattern
+    # The response should be {"@odata...": "...", "value": [...]}
+    # Find the last "]}" which closes the value array and root object
+    idx = text.rfind("]}")
+    if idx > 0:
+        candidate = text[:idx + 2]
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
     return None
 
 
