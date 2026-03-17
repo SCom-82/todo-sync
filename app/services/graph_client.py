@@ -17,7 +17,7 @@ class MSGraphToDoClient:
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(timeout=30.0)
+            self._client = httpx.AsyncClient(timeout=60.0, limits=httpx.Limits(max_connections=10))
         return self._client
 
     async def _headers(self) -> dict[str, str]:
@@ -48,7 +48,11 @@ class MSGraphToDoClient:
             response.raise_for_status()
             if response.status_code == 204:
                 return {}
-            return response.json()
+            try:
+                return response.json()
+            except Exception as e:
+                logger.error("Failed to parse JSON response (len=%d): %s", len(response.content), e)
+                raise
 
         raise RuntimeError("Max retries exceeded for Graph API request")
 
@@ -68,8 +72,9 @@ class MSGraphToDoClient:
         await self._request("DELETE", f"{BASE_URL}/lists/{list_ms_id}")
 
     async def get_lists_delta(self, delta_link: str | None = None) -> dict:
-        url = delta_link or f"{BASE_URL}/lists/delta"
+        url = delta_link or f"{BASE_URL}/lists/delta?$top=20"
         all_values = []
+        result = {}
         while url:
             result = await self._request("GET", url)
             all_values.extend(result.get("value", []))
@@ -100,7 +105,7 @@ class MSGraphToDoClient:
         await self._request("DELETE", f"{BASE_URL}/lists/{list_ms_id}/tasks/{task_ms_id}")
 
     async def get_tasks_delta(self, list_ms_id: str, delta_link: str | None = None) -> dict:
-        url = delta_link or f"{BASE_URL}/lists/{list_ms_id}/tasks/delta"
+        url = delta_link or f"{BASE_URL}/lists/{list_ms_id}/tasks/delta?$top=20"
         all_values = []
         result = {}
         while url:

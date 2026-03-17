@@ -309,24 +309,27 @@ async def run_sync(sync_type: str = "delta") -> dict:
             lists_upserted, lists_deleted = await pull_lists(db)
             total_pulled += lists_upserted
             total_deleted += lists_deleted
+            await db.commit()
 
-            # Pull tasks for each list
+            # Pull tasks for each list (commit after each list)
             result = await db.execute(
                 select(TaskList).where(TaskList.deleted_at.is_(None), TaskList.ms_id.is_not(None))
             )
-            for task_list in result.scalars().all():
+            task_lists = list(result.scalars().all())
+            for task_list in task_lists:
                 try:
                     tasks_upserted, tasks_deleted = await pull_tasks_for_list(db, task_list)
                     total_pulled += tasks_upserted
                     total_deleted += tasks_deleted
+                    await db.commit()
                 except Exception:
                     logger.exception("Failed to pull tasks for list %s", task_list.ms_id)
+                    await db.rollback()
                     total_errors += 1
 
             # Push pending changes
             pushed_lists, pushed_tasks = await push_pending(db)
             total_pushed += pushed_lists + pushed_tasks
-
             await db.commit()
 
             duration_ms = int((time.monotonic() - start) * 1000)
