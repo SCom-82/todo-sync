@@ -154,13 +154,24 @@ class MSGraphToDoClient:
         url = delta_link or f"{BASE_URL}/lists/{list_ms_id}/tasks/delta"
         all_values = []
         result = {}
+        skipped_pages = 0
         while url:
-            result = await self._request("GET", url)
-            all_values.extend(result.get("value", []))
-            url = result.get("@odata.nextLink")
+            try:
+                result = await self._request("GET", url)
+                all_values.extend(result.get("value", []))
+                url = result.get("@odata.nextLink")
+            except (json.JSONDecodeError, Exception) as e:
+                if "JSONDecodeError" in type(e).__name__ or "JSON" in str(e):
+                    logger.warning("Skipping unparseable delta page for list %s: %s", list_ms_id, e)
+                    skipped_pages += 1
+                    # Can't get nextLink from broken response, stop pagination
+                    break
+                raise
+        if skipped_pages:
+            logger.warning("Delta sync for list %s: skipped %d pages, got %d items", list_ms_id, skipped_pages, len(all_values))
         return {
             "value": all_values,
-            "delta_link": result.get("@odata.deltaLink"),
+            "delta_link": result.get("@odata.deltaLink") if result else None,
         }
 
     async def close(self) -> None:
