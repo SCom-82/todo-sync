@@ -50,10 +50,23 @@ curl -s -H "X-API-Key: $TODO_SYNC_API_KEY" "$TODO_SYNC_URL/api/v1/tasks?status=n
 curl -s -H "X-API-Key: $TODO_SYNC_API_KEY" "$TODO_SYNC_URL/api/v1/tasks?search=ТЕКСТ"
 ```
 
-### Задачи с дедлайном на сегодня
+### Задачи на сегодня
 ```bash
-curl -s -H "X-API-Key: $TODO_SYNC_API_KEY" "$TODO_SYNC_URL/api/v1/tasks?due_before=$(date -I)&status=notStarted"
+curl -s -H "X-API-Key: $TODO_SYNC_API_KEY" "$TODO_SYNC_URL/api/v1/tasks?filter=today"
 ```
+Возвращает незавершённые задачи с дедлайном на сегодня.
+
+### Просроченные задачи (через filter)
+```bash
+curl -s -H "X-API-Key: $TODO_SYNC_API_KEY" "$TODO_SYNC_URL/api/v1/tasks?filter=overdue"
+```
+Возвращает незавершённые задачи с просроченным дедлайном.
+
+### Задачи на неделю
+```bash
+curl -s -H "X-API-Key: $TODO_SYNC_API_KEY" "$TODO_SYNC_URL/api/v1/tasks?filter=week"
+```
+Возвращает незавершённые задачи на ближайшие 7 дней.
 
 ### Создать задачу
 ```bash
