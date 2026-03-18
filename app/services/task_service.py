@@ -135,6 +135,7 @@ async def delete_list(db: AsyncSession, list_id: uuid.UUID) -> bool:
 async def get_tasks(
     db: AsyncSession,
     list_id: uuid.UUID | None = None,
+    filter: str | None = None,
     status: str | None = None,
     importance: str | None = None,
     overdue: bool = False,
@@ -144,19 +145,30 @@ async def get_tasks(
     limit: int = 50,
     offset: int = 0,
 ) -> list[Task]:
+    today = _today()
     q = select(Task).where(Task.deleted_at.is_(None))
     if list_id:
         q = q.where(Task.list_id == list_id)
-    if status:
-        q = q.where(Task.status == status)
+    # Convenience filter shortcuts (exclude completed by default)
+    if filter == "today":
+        q = q.where(and_(Task.due_date == today, Task.status != "completed"))
+    elif filter == "overdue":
+        q = q.where(and_(Task.due_date < today, Task.status != "completed"))
+    elif filter == "week":
+        week_end = today + timedelta(days=7)
+        q = q.where(and_(Task.due_date >= today, Task.due_date <= week_end, Task.status != "completed"))
+    else:
+        # Original individual filters
+        if status:
+            q = q.where(Task.status == status)
+        if overdue:
+            q = q.where(and_(Task.due_date < today, Task.status != "completed"))
+        if due_before:
+            q = q.where(Task.due_date <= due_before)
+        if due_after:
+            q = q.where(Task.due_date >= due_after)
     if importance:
         q = q.where(Task.importance == importance)
-    if overdue:
-        q = q.where(and_(Task.due_date < _today(), Task.status != "completed"))
-    if due_before:
-        q = q.where(Task.due_date <= due_before)
-    if due_after:
-        q = q.where(Task.due_date >= due_after)
     if search:
         pattern = f"%{search}%"
         q = q.where(or_(Task.title.ilike(pattern), Task.body.ilike(pattern)))
@@ -276,8 +288,8 @@ async def get_stats(db: AsyncSession) -> dict:
             func.count().filter(Task.status == "inProgress").label("in_progress"),
             func.count().filter(Task.status == "completed").label("completed"),
             func.count().filter(and_(Task.due_date < today, Task.status != "completed")).label("overdue"),
-            func.count().filter(Task.due_date == today).label("due_today"),
-            func.count().filter(and_(Task.due_date >= today, Task.due_date <= week_end)).label("due_this_week"),
+            func.count().filter(and_(Task.due_date == today, Task.status != "completed")).label("due_today"),
+            func.count().filter(and_(Task.due_date >= today, Task.due_date <= week_end, Task.status != "completed")).label("due_this_week"),
         ).where(Task.deleted_at.is_(None))
     )
     row = result.one()

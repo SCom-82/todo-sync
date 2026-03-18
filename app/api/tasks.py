@@ -14,6 +14,7 @@ router = APIRouter(prefix="/tasks", tags=["tasks"])
 @router.get("", response_model=list[TaskResponse])
 async def list_tasks(
     list_id: uuid.UUID | None = None,
+    filter: str | None = None,
     status: str | None = None,
     importance: str | None = None,
     overdue: bool = False,
@@ -27,6 +28,7 @@ async def list_tasks(
     return await task_service.get_tasks(
         db,
         list_id=list_id,
+        filter=filter,
         status=status,
         importance=importance,
         overdue=overdue,
