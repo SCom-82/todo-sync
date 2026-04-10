@@ -150,6 +150,39 @@ class MSGraphToDoClient:
     async def delete_task(self, list_ms_id: str, task_ms_id: str) -> None:
         await self._request("DELETE", f"{BASE_URL}/lists/{list_ms_id}/tasks/{task_ms_id}")
 
+    # --- Checklist items ---
+
+    async def get_checklist_items(self, list_ms_id: str, task_ms_id: str) -> list[dict]:
+        url = f"{BASE_URL}/lists/{list_ms_id}/tasks/{task_ms_id}/checklistItems"
+        all_items: list[dict] = []
+        while url:
+            result = await self._request("GET", url)
+            all_items.extend(result.get("value", []))
+            url = result.get("@odata.nextLink")
+        return all_items
+
+    async def create_checklist_item(self, list_ms_id: str, task_ms_id: str, data: dict) -> dict:
+        return await self._request(
+            "POST",
+            f"{BASE_URL}/lists/{list_ms_id}/tasks/{task_ms_id}/checklistItems",
+            json_body=data,
+        )
+
+    async def update_checklist_item(
+        self, list_ms_id: str, task_ms_id: str, item_id: str, data: dict
+    ) -> dict:
+        return await self._request(
+            "PATCH",
+            f"{BASE_URL}/lists/{list_ms_id}/tasks/{task_ms_id}/checklistItems/{item_id}",
+            json_body=data,
+        )
+
+    async def delete_checklist_item(self, list_ms_id: str, task_ms_id: str, item_id: str) -> None:
+        await self._request(
+            "DELETE",
+            f"{BASE_URL}/lists/{list_ms_id}/tasks/{task_ms_id}/checklistItems/{item_id}",
+        )
+
     async def get_tasks_delta(self, list_ms_id: str, delta_link: str | None = None) -> dict:
         url = delta_link or f"{BASE_URL}/lists/{list_ms_id}/tasks/delta"
         all_values = []

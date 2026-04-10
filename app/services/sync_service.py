@@ -232,6 +232,25 @@ async def pull_tasks_for_list(db: AsyncSession, task_list: TaskList) -> tuple[in
             db.add(new_task)
         upserted += 1
 
+    # Graph Delta API не поддерживает $expand=checklistItems, поэтому подтягиваем
+    # checklist items отдельным запросом per-task для всех изменённых (не удалённых) задач.
+    # Флаг sync_status == "pending_push" защищает локальные несинхронизированные правки.
+    await db.flush()
+    upserted_ms_ids = [
+        item["id"] for item in delta_result["value"]
+        if "@removed" not in item and item.get("id")
+    ]
+    for task_ms_id in upserted_ms_ids:
+        try:
+            items = await graph_client.get_checklist_items(task_list.ms_id, task_ms_id)
+        except Exception as e:
+            logger.warning("Failed to fetch checklistItems for task %s: %s", task_ms_id, e)
+            continue
+        result = await db.execute(select(Task).where(Task.ms_id == task_ms_id))
+        task = result.scalar_one_or_none()
+        if task and task.sync_status != "pending_push":
+            task.checklist_items = items
+
     state.delta_link = delta_result.get("delta_link")
     state.last_sync_at = datetime.now(timezone.utc)
     state.last_sync_status = "success"
@@ -240,6 +259,77 @@ async def pull_tasks_for_list(db: AsyncSession, task_list: TaskList) -> tuple[in
 
 
 # --- Push: PostgreSQL → MS To Do ---
+
+async def _push_checklist_items(task: Task, list_ms_id: str) -> None:
+    """Diff local checklist_items vs remote и применить create/update/delete.
+
+    Мутирует task.checklist_items (проставляет id новым элементам).
+    Вызывается после успешного create_task/update_task в push_pending.
+    """
+    if not task.ms_id:
+        return
+
+    try:
+        remote_items = await graph_client.get_checklist_items(list_ms_id, task.ms_id)
+    except Exception:
+        logger.exception("Failed to fetch remote checklistItems for task %s", task.id)
+        return
+
+    remote_by_id = {it["id"]: it for it in remote_items if it.get("id")}
+    local_items = list(task.checklist_items or [])
+    local_ids = {it.get("id") for it in local_items if it.get("id")}
+
+    for remote_id in set(remote_by_id) - local_ids:
+        try:
+            await graph_client.delete_checklist_item(list_ms_id, task.ms_id, remote_id)
+        except Exception:
+            logger.exception("Failed to delete checklistItem %s", remote_id)
+
+    changed = False
+    for item in local_items:
+        item_id = item.get("id")
+        if not item_id:
+            try:
+                created = await graph_client.create_checklist_item(
+                    list_ms_id,
+                    task.ms_id,
+                    {
+                        "displayName": item.get("displayName", ""),
+                        "isChecked": bool(item.get("isChecked", False)),
+                    },
+                )
+                item["id"] = created.get("id")
+                if created.get("createdDateTime"):
+                    item["createdDateTime"] = created["createdDateTime"]
+                changed = True
+            except Exception:
+                logger.exception("Failed to create checklistItem for task %s", task.id)
+            continue
+
+        remote = remote_by_id.get(item_id)
+        if not remote:
+            continue
+        if (
+            remote.get("displayName") != item.get("displayName")
+            or bool(remote.get("isChecked")) != bool(item.get("isChecked"))
+        ):
+            try:
+                await graph_client.update_checklist_item(
+                    list_ms_id,
+                    task.ms_id,
+                    item_id,
+                    {
+                        "displayName": item.get("displayName", ""),
+                        "isChecked": bool(item.get("isChecked", False)),
+                    },
+                )
+            except Exception:
+                logger.exception("Failed to update checklistItem %s", item_id)
+
+    if changed:
+        # SQLAlchemy не замечает мутации внутри JSONB — принудительно пересоздаём.
+        task.checklist_items = [dict(it) for it in local_items]
+
 
 async def push_pending(db: AsyncSession) -> tuple[int, int]:
     """Push locally changed items to MS To Do. Returns (pushed_lists, pushed_tasks)."""
@@ -292,6 +382,7 @@ async def push_pending(db: AsyncSession) -> tuple[int, int]:
             else:
                 resp = await graph_client.create_task(task_list.ms_id, payload)
                 task.ms_id = resp.get("id")
+            await _push_checklist_items(task, task_list.ms_id)
             task.sync_status = "synced"
             pushed_tasks += 1
         except Exception:

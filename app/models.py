@@ -64,6 +64,7 @@ class Task(Base):
     completed_timezone: Mapped[str | None] = mapped_column(String(50), nullable=True)
     recurrence: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     categories: Mapped[list] = mapped_column(JSONB, default=list)
+    checklist_items: Mapped[list] = mapped_column(JSONB, nullable=False, server_default="[]", default=list)
     ms_created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     ms_last_modified: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

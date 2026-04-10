@@ -185,6 +185,20 @@ async def get_task(db: AsyncSession, task_id: uuid.UUID) -> Task | None:
     return result.scalar_one_or_none()
 
 
+async def _try_push_checklist_items(task: Task, list_ms_id: str | None) -> None:
+    """Best-effort immediate push checklist items в Graph после успешного create/update.
+
+    Lazy-import _push_checklist_items из sync_service, чтобы избежать circular.
+    """
+    if not list_ms_id or not task.ms_id or not task.checklist_items:
+        return
+    try:
+        from app.services.sync_service import _push_checklist_items
+        await _push_checklist_items(task, list_ms_id)
+    except Exception:
+        logger.exception("Failed to push checklist items for task %s, will retry on next sync", task.id)
+
+
 async def create_task(db: AsyncSession, data: TaskCreate) -> Task:
     list_result = await db.execute(
         select(TaskList).where(TaskList.id == data.list_id, TaskList.deleted_at.is_(None))
@@ -202,11 +216,13 @@ async def create_task(db: AsyncSession, data: TaskCreate) -> Task:
         reminder_datetime=data.reminder_datetime,
         is_reminder_on=data.is_reminder_on,
         categories=data.categories,
+        checklist_items=[it.model_dump() for it in data.checklist_items],
         sync_status="pending_push",
     )
     db.add(task)
     await db.flush()
     await _try_push_task(task, task_list.ms_id, "create")
+    await _try_push_checklist_items(task, task_list.ms_id)
     await db.commit()
     await db.refresh(task)
     return task
@@ -217,13 +233,17 @@ async def update_task(db: AsyncSession, task_id: uuid.UUID, data: TaskUpdate) ->
     if not task:
         return None
     update_fields = data.model_dump(exclude_unset=True)
+    checklist_touched = "checklist_items" in update_fields
     for field, value in update_fields.items():
         setattr(task, field, value)
     task.sync_status = "pending_push"
 
     list_result = await db.execute(select(TaskList).where(TaskList.id == task.list_id))
     task_list = list_result.scalar_one_or_none()
-    await _try_push_task(task, task_list.ms_id if task_list else None, "update")
+    list_ms_id = task_list.ms_id if task_list else None
+    await _try_push_task(task, list_ms_id, "update")
+    if checklist_touched:
+        await _try_push_checklist_items(task, list_ms_id)
     await db.commit()
     await db.refresh(task)
     return task

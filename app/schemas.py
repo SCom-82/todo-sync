@@ -30,6 +30,13 @@ class TaskListResponse(BaseModel):
 
 # --- Tasks ---
 
+class ChecklistItem(BaseModel):
+    """Один пункт чек-листа (подзадача) Microsoft To Do."""
+    id: str | None = None          # ms_id из Graph; None для новых, созданных через API
+    displayName: str = Field(..., max_length=1000)
+    isChecked: bool = False
+
+
 class TaskCreate(BaseModel):
     list_id: uuid.UUID
     title: str = Field(..., max_length=1000)
@@ -39,6 +46,7 @@ class TaskCreate(BaseModel):
     reminder_datetime: datetime | None = None
     is_reminder_on: bool = False
     categories: list[str] = Field(default_factory=list)
+    checklist_items: list[ChecklistItem] = Field(default_factory=list)
 
 
 class TaskUpdate(BaseModel):
@@ -50,6 +58,7 @@ class TaskUpdate(BaseModel):
     reminder_datetime: datetime | None = None
     is_reminder_on: bool | None = None
     categories: list[str] | None = None
+    checklist_items: list[ChecklistItem] | None = None
 
 
 class TaskResponse(BaseModel):
@@ -66,6 +75,7 @@ class TaskResponse(BaseModel):
     completed_datetime: datetime | None = None
     recurrence: dict | None = None
     categories: list = Field(default_factory=list)
+    checklist_items: list = Field(default_factory=list)
     sync_status: str
     created_at: datetime
     updated_at: datetime
