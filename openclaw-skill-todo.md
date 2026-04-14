@@ -40,6 +40,18 @@ curl -s -H "X-API-Key: $TODO_SYNC_API_KEY" "$TODO_SYNC_URL/api/v1/lists"
 curl -s -H "X-API-Key: $TODO_SYNC_API_KEY" "$TODO_SYNC_URL/api/v1/tasks?list_id=UUID"
 ```
 
+### Задачи из списка по имени (F1.1)
+```bash
+curl -s -H "X-API-Key: $TODO_SYNC_API_KEY" "$TODO_SYNC_URL/api/v1/tasks?list_name=dev-coder"
+```
+Удобнее чем `list_id` — UUID нестабильны между миграциями БД. Используй `list_name` в автоматизации.
+
+### Разрешить id списка по имени (F1.1)
+```bash
+curl -s -H "X-API-Key: $TODO_SYNC_API_KEY" "$TODO_SYNC_URL/api/v1/lists/resolve?name=dev-coder"
+```
+Возвращает `{id, ms_id, display_name}`. 404 если не найден, 409 если имя неоднозначное (несколько списков).
+
 ### Незавершённые задачи
 ```bash
 curl -s -H "X-API-Key: $TODO_SYNC_API_KEY" "$TODO_SYNC_URL/api/v1/tasks?status=notStarted"
@@ -72,17 +84,40 @@ curl -s -H "X-API-Key: $TODO_SYNC_API_KEY" "$TODO_SYNC_URL/api/v1/tasks?filter=w
 ```bash
 curl -s -X POST -H "X-API-Key: $TODO_SYNC_API_KEY" -H "Content-Type: application/json" \
   "$TODO_SYNC_URL/api/v1/tasks" \
-  -d '{"list_id":"UUID_СПИСКА", "title":"Название задачи", "importance":"normal", "due_date":"2026-03-20"}'
+  -d '{"list_name":"dev-coder", "title":"Название задачи", "importance":"normal", "due_datetime":"2026-03-20T15:00:00+04:00"}'
 ```
-Параметры:
-- `list_id` (обязательно) — UUID списка (получи через GET /lists)
+Параметры (указать ровно **один** из `list_name` / `list_id` / `list_ms_id`):
+- `list_name` — имя списка (F1.1, рекомендовано)
+- `list_id` — внутренний UUID списка
+- `list_ms_id` — id списка в MS Graph
 - `title` (обязательно) — название
 - `importance` — `low`, `normal`, `high`
-- `due_date` — дата дедлайна (YYYY-MM-DD)
+- `due_date` — дата дедлайна (YYYY-MM-DD) — legacy, используй `due_datetime`
+- `due_datetime` (F1.2) — полный datetime с таймзоной, ISO 8601 (`2026-03-20T15:00:00+04:00` или `...Z`)
+- `start_datetime` / `start_timezone` (F1.2) — дата старта и её таймзона (`Europe/Samara`)
 - `body` — описание/заметки
+- `body_content_type` (F1.3) — `text` (default) или `html`
 - `reminder_datetime` — дата+время напоминания (ISO 8601)
 - `is_reminder_on` — `true`/`false`
 - `categories` — массив тегов `["тег1", "тег2"]`
+- `recurrence` (F1.4) — объект повторения: `{"pattern":{"type":"daily","interval":1},"range":{"type":"noEnd","startDate":"2026-04-14"}}`
+
+Пример с HTML-body:
+```json
+{"list_name":"personalos","title":"Отчёт","body":"<b>Сводка</b>: ...","body_content_type":"html"}
+```
+
+Пример с повторением каждую неделю в пн/ср/пт:
+```json
+{
+  "list_name":"dev-coder",
+  "title":"Daily standup",
+  "recurrence":{
+    "pattern":{"type":"weekly","interval":1,"daysOfWeek":["monday","wednesday","friday"]},
+    "range":{"type":"noEnd","startDate":"2026-04-14"}
+  }
+}
+```
 
 ### Завершить задачу
 ```bash
@@ -104,6 +139,32 @@ curl -s -X PATCH -H "X-API-Key: $TODO_SYNC_API_KEY" -H "Content-Type: applicatio
 ### Удалить задачу
 ```bash
 curl -s -X DELETE -H "X-API-Key: $TODO_SYNC_API_KEY" "$TODO_SYNC_URL/api/v1/tasks/UUID"
+```
+
+### Checklist items (F1.5)
+
+Получить checklist задачи:
+```bash
+curl -s -H "X-API-Key: $TODO_SYNC_API_KEY" "$TODO_SYNC_URL/api/v1/tasks/UUID/checklist"
+```
+
+Добавить пункт:
+```bash
+curl -s -X POST -H "X-API-Key: $TODO_SYNC_API_KEY" -H "Content-Type: application/json" \
+  "$TODO_SYNC_URL/api/v1/tasks/UUID/checklist" \
+  -d '{"displayName":"Купить хлеб","isChecked":false}'
+```
+
+Обновить один пункт (поточечно, без перезаписи всего списка):
+```bash
+curl -s -X PATCH -H "X-API-Key: $TODO_SYNC_API_KEY" -H "Content-Type: application/json" \
+  "$TODO_SYNC_URL/api/v1/tasks/UUID/checklist/ITEM_ID" \
+  -d '{"isChecked":true}'
+```
+
+Удалить пункт:
+```bash
+curl -s -X DELETE -H "X-API-Key: $TODO_SYNC_API_KEY" "$TODO_SYNC_URL/api/v1/tasks/UUID/checklist/ITEM_ID"
 ```
 
 ### Создать новый список
