@@ -15,4 +15,7 @@ ENV PYTHONPATH=/app
 
 EXPOSE 8000
 
+HEALTHCHECK --interval=5s --timeout=5s --start-period=30s --retries=10 \
+    CMD curl -f http://localhost:8000/api/v1/healthz || exit 1
+
 CMD ["sh", "-c", "python -m app.init_db && alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips='*'"]
