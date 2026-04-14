@@ -1,11 +1,13 @@
 import uuid
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.schemas import TaskListCreate, TaskListResponse, TaskListUpdate
+from app.schemas import ShareListIn, ShareListOut, TaskListCreate, TaskListResponse, TaskListUpdate
 from app.services import task_service
+from app.services.graph_client import graph_client
 
 router = APIRouter(prefix="/lists", tags=["task_lists"])
 
@@ -71,3 +73,56 @@ async def delete_task_list(list_id: uuid.UUID, db: AsyncSession = Depends(get_db
     deleted = await task_service.delete_list(db, list_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="List not found")
+
+
+@router.post("/{list_id}/share", response_model=ShareListOut, status_code=200)
+async def share_task_list(
+    list_id: uuid.UUID,
+    data: ShareListIn,
+    db: AsyncSession = Depends(get_db),
+):
+    """F3.3: Invite a user to share a To Do list via Microsoft Graph API.
+
+    Requires the list to exist locally and to have a corresponding ms_id.
+    Errors: 404 if list not found; 403 if caller is not the list owner; 502 for other Graph errors.
+    """
+    from sqlalchemy import select
+    from app.models import TaskList
+
+    result = await db.execute(
+        select(TaskList).where(TaskList.id == list_id, TaskList.deleted_at.is_(None))
+    )
+    task_list = result.scalar_one_or_none()
+    if not task_list:
+        raise HTTPException(status_code=404, detail="List not found")
+
+    if not task_list.ms_id:
+        raise HTTPException(
+            status_code=400,
+            detail="List has no Microsoft Graph ID — sync the list first before sharing.",
+        )
+
+    try:
+        graph_resp = await graph_client.share_list(
+            task_list.ms_id,
+            email=str(data.email),
+            permission=data.permission,
+        )
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        if status == 404:
+            raise HTTPException(status_code=404, detail="List not found in Microsoft Graph")
+        if status == 403:
+            raise HTTPException(
+                status_code=403, detail="You are not the owner of this list and cannot share it"
+            )
+        raise HTTPException(
+            status_code=502,
+            detail=f"Microsoft Graph API error: {status} — {exc.response.text[:500]}",
+        )
+
+    return ShareListOut(
+        invited_user_email=str(data.email),
+        permission=data.permission,
+        raw=graph_resp,
+    )

@@ -32,6 +32,10 @@ async def get_sync_status(db: AsyncSession = Depends(get_db)):
     last_sync_at = None
     last_status = None
     resources = []
+    # F3.6: aggregate metrics across all sync_state rows
+    total_delta_syncs = 0
+    total_delta_succeeded = 0
+    total_full_resets = 0
     for s in states:
         resources.append({
             "resource_type": s.resource_type,
@@ -42,10 +46,20 @@ async def get_sync_status(db: AsyncSession = Depends(get_db)):
         if s.last_sync_at and (last_sync_at is None or s.last_sync_at > last_sync_at):
             last_sync_at = s.last_sync_at
             last_status = s.last_sync_status
+        total_delta_syncs += s.delta_syncs_total or 0
+        total_delta_succeeded += s.delta_syncs_succeeded or 0
+        total_full_resets += s.delta_full_resets_total or 0
+    skip_rate = 0.0
+    if total_delta_syncs > 0:
+        skip_rate = round((total_delta_succeeded / total_delta_syncs) * 100, 2)
     return SyncStatusResponse(
         last_sync_at=last_sync_at,
         last_sync_status=last_status,
         resources=resources,
+        delta_syncs_total=total_delta_syncs,
+        delta_syncs_succeeded=total_delta_succeeded,
+        delta_full_resets_total=total_full_resets,
+        delta_skip_rate_pct=skip_rate,
     )
 
 

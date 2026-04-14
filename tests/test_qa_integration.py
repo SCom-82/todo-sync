@@ -69,6 +69,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     recurrence TEXT,
     categories TEXT NOT NULL DEFAULT '[]',
     checklist_items TEXT NOT NULL DEFAULT '[]',
+    has_attachments INTEGER NOT NULL DEFAULT 0,
     ms_created_at TEXT,
     ms_last_modified TEXT,
     created_at TEXT DEFAULT (datetime('now')),
@@ -84,6 +85,9 @@ CREATE TABLE IF NOT EXISTS sync_state (
     last_sync_at TEXT,
     last_sync_status TEXT NOT NULL DEFAULT 'success',
     last_error TEXT,
+    delta_syncs_total INTEGER NOT NULL DEFAULT 0,
+    delta_syncs_succeeded INTEGER NOT NULL DEFAULT 0,
+    delta_full_resets_total INTEGER NOT NULL DEFAULT 0,
     created_at TEXT DEFAULT (datetime('now')),
     updated_at TEXT DEFAULT (datetime('now'))
 );

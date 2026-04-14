@@ -1,6 +1,7 @@
 import uuid
 from datetime import date, datetime
 
+import sqlalchemy as sa
 from sqlalchemy import (
     Boolean,
     Date,
@@ -69,6 +70,8 @@ class Task(Base):
     recurrence: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     categories: Mapped[list] = mapped_column(JSONB, default=list)
     checklist_items: Mapped[list] = mapped_column(JSONB, nullable=False, server_default="[]", default=list)
+    # F3.5: whether task has any attachments (set from Graph hasAttachments or local attachment records)
+    has_attachments: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false", default=False)
     ms_created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     ms_last_modified: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -79,6 +82,8 @@ class Task(Base):
     sync_status: Mapped[str] = mapped_column(String(20), default="synced")
 
     task_list: Mapped["TaskList"] = relationship("TaskList", back_populates="tasks")
+    linked_resources: Mapped[list["LinkedResource"]] = relationship("LinkedResource", back_populates="task", cascade="all, delete-orphan", lazy="selectin")
+    attachments: Mapped[list["TaskAttachment"]] = relationship("TaskAttachment", back_populates="task", cascade="all, delete-orphan", lazy="selectin")
 
     __table_args__ = (
         Index("ix_tasks_ms_id", "ms_id"),
@@ -99,6 +104,10 @@ class SyncState(Base):
     last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_sync_status: Mapped[str] = mapped_column(String(20), default="success")
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # F3.6: delta sync metrics
+    delta_syncs_total: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0", default=0)
+    delta_syncs_succeeded: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0", default=0)
+    delta_full_resets_total: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0", default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -128,3 +137,62 @@ class SyncLog(Base):
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     details: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+# --- F2.1: LinkedResource ---
+
+class LinkedResource(Base):
+    __tablename__ = "linked_resources"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    task_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False
+    )
+    ms_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    web_url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(500), nullable=False)
+    application_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    external_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    sync_status: Mapped[str] = mapped_column(String(20), default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    task: Mapped["Task"] = relationship("Task", back_populates="linked_resources")
+
+    __table_args__ = (
+        Index("ix_linked_resources_task_id", "task_id"),
+        Index("ix_linked_resources_ms_id", "ms_id"),
+        Index("ix_linked_resources_sync_status", "sync_status"),
+    )
+
+
+# --- F2.2: TaskAttachment ---
+
+MAX_ATTACHMENT_BYTES = 3 * 1024 * 1024  # 3 MB
+
+
+class TaskAttachment(Base):
+    __tablename__ = "task_attachments"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    task_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False
+    )
+    ms_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    name: Mapped[str] = mapped_column(String(500), nullable=False)
+    content_type: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    content_bytes: Mapped[bytes | None] = mapped_column(sa.LargeBinary(), nullable=True)
+    reference_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    sync_status: Mapped[str] = mapped_column(String(20), default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    task: Mapped["Task"] = relationship("Task", back_populates="attachments")
+
+    __table_args__ = (
+        Index("ix_task_attachments_task_id", "task_id"),
+        Index("ix_task_attachments_ms_id", "ms_id"),
+        Index("ix_task_attachments_sync_status", "sync_status"),
+    )

@@ -140,6 +140,22 @@ class MSGraphToDoClient:
             all_tasks.extend(result.get("value", []))
             url = result.get("@odata.nextLink")
         return all_tasks
+    async def get_tasks_with_expand(self, list_ms_id: str) -> list[dict]:
+        """F2.6: Non-delta full pull with $expand=checklistItems,linkedResources.
+
+        Reduces N+1 by including checklistItems and linkedResources inline.
+        Attachments are NOT supported via $expand in Graph API.
+        """
+        all_tasks = []
+        params = {"$expand": "checklistItems,linkedResources"}
+        url = f"{BASE_URL}/lists/{list_ms_id}/tasks"
+        while url:
+            result = await self._request("GET", url, params=params if not all_tasks else None)
+            all_tasks.extend(result.get("value", []))
+            url = result.get("@odata.nextLink")
+            params = None
+        return all_tasks
+
 
     async def create_task(self, list_ms_id: str, task_data: dict) -> dict:
         return await self._request("POST", f"{BASE_URL}/lists/{list_ms_id}/tasks", json_body=task_data)
@@ -207,6 +223,97 @@ class MSGraphToDoClient:
             "delta_link": result.get("@odata.deltaLink") if result else None,
         }
 
+
+    # --- F2.5: LinkedResources ---
+
+    async def list_linked_resources(self, list_ms_id: str, task_ms_id: str) -> list[dict]:
+        url = f"{BASE_URL}/lists/{list_ms_id}/tasks/{task_ms_id}/linkedResources"
+        all_items: list[dict] = []
+        while url:
+            result = await self._request("GET", url)
+            all_items.extend(result.get("value", []))
+            url = result.get("@odata.nextLink")
+        return all_items
+
+    async def create_linked_resource(self, list_ms_id: str, task_ms_id: str, data: dict) -> dict:
+        return await self._request(
+            "POST",
+            f"{BASE_URL}/lists/{list_ms_id}/tasks/{task_ms_id}/linkedResources",
+            json_body=data,
+        )
+
+    async def update_linked_resource(
+        self, list_ms_id: str, task_ms_id: str, lr_ms_id: str, data: dict
+    ) -> dict:
+        return await self._request(
+            "PATCH",
+            f"{BASE_URL}/lists/{list_ms_id}/tasks/{task_ms_id}/linkedResources/{lr_ms_id}",
+            json_body=data,
+        )
+
+    async def delete_linked_resource(self, list_ms_id: str, task_ms_id: str, lr_ms_id: str) -> None:
+        await self._request(
+            "DELETE",
+            f"{BASE_URL}/lists/{list_ms_id}/tasks/{task_ms_id}/linkedResources/{lr_ms_id}",
+        )
+
+    # --- F2.5: Attachments ---
+
+    async def list_attachments(self, list_ms_id: str, task_ms_id: str) -> list[dict]:
+        """List attachments for a task. Note: $expand not supported for attachments in Graph."""
+        url = f"{BASE_URL}/lists/{list_ms_id}/tasks/{task_ms_id}/attachments"
+        all_items: list[dict] = []
+        while url:
+            result = await self._request("GET", url)
+            all_items.extend(result.get("value", []))
+            url = result.get("@odata.nextLink")
+        return all_items
+
+    async def create_attachment(self, list_ms_id: str, task_ms_id: str, data: dict) -> dict:
+        """Create a small attachment (<=3 MB). data must include contentBytes as base64 string."""
+        return await self._request(
+            "POST",
+            f"{BASE_URL}/lists/{list_ms_id}/tasks/{task_ms_id}/attachments",
+            json_body=data,
+        )
+
+    async def delete_attachment(self, list_ms_id: str, task_ms_id: str, att_ms_id: str) -> None:
+        await self._request(
+            "DELETE",
+            f"{BASE_URL}/lists/{list_ms_id}/tasks/{task_ms_id}/attachments/{att_ms_id}",
+        )
+
+
+    # --- F3.3: Share list ---
+
+    async def share_list(self, list_ms_id: str, email: str, permission: str) -> dict:
+        """Invite a user to share a To Do list.
+
+        POST /me/todo/lists/{id}/members
+        See: https://learn.microsoft.com/en-us/graph/api/todotasklist-post-members
+
+        Args:
+            list_ms_id: Microsoft ID of the list.
+            email: Email address of the user to invite.
+            permission: "read" or "readwrite".
+
+        Returns:
+            Invitation info dict from Graph API.
+
+        Raises:
+            httpx.HTTPStatusError: with status_code 404 (list not found), 403 (not owner),
+                or other Graph errors.
+        """
+        payload = {
+            "displayName": email,
+            "sharedWithUserPermission": permission,
+        }
+        return await self._request(
+            "POST",
+            f"{BASE_URL}/lists/{list_ms_id}/members",
+            json_body=payload,
+        )
+
     async def close(self) -> None:
         if self._client and not self._client.is_closed:
             await self._client.aclose()
@@ -214,6 +321,8 @@ class MSGraphToDoClient:
 
 class DeltaLinkExpiredError(Exception):
     pass
+
+
 
 
 graph_client = MSGraphToDoClient()

@@ -191,11 +191,31 @@ class TaskResponse(BaseModel):
     recurrence: dict | None = None
     categories: list = Field(default_factory=list)
     checklist_items: list = Field(default_factory=list)
+    # F3.5: derived fields — body_preview is computed in validator; has_attachments from DB column
+    body_preview: str | None = None
+    has_attachments: bool = False
     sync_status: str
     created_at: datetime
     updated_at: datetime
 
     model_config = {"from_attributes": True}
+
+    @model_validator(mode="after")
+    def compute_body_preview(self) -> "TaskResponse":
+        """Compute body_preview from body (first 256 chars, word-boundary trim)."""
+        if self.body_preview is None and self.body:
+            text = self.body
+            if len(text) <= 256:
+                self.body_preview = text
+            else:
+                # Trim at word boundary (last space within first 256 chars)
+                truncated = text[:256]
+                last_space = truncated.rfind(" ")
+                if last_space > 0:
+                    self.body_preview = truncated[:last_space]
+                else:
+                    self.body_preview = truncated
+        return self
 
 
 # --- Stats ---
@@ -230,6 +250,11 @@ class SyncStatusResponse(BaseModel):
     last_sync_at: datetime | None
     last_sync_status: str | None
     resources: list[dict]
+    # F3.6: aggregate delta metrics
+    delta_syncs_total: int = 0
+    delta_syncs_succeeded: int = 0
+    delta_full_resets_total: int = 0
+    delta_skip_rate_pct: float = 0.0
 
 
 class SyncLogEntry(BaseModel):
@@ -244,3 +269,77 @@ class SyncLogEntry(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+# --- F2.1: LinkedResource ---
+
+from pydantic import AnyHttpUrl
+
+
+class LinkedResourceIn(BaseModel):
+    web_url: AnyHttpUrl
+    display_name: str = Field(..., max_length=500)
+    application_name: str | None = Field(None, max_length=255)
+    external_id: str | None = Field(None, max_length=255)
+
+
+class LinkedResourceUpdate(BaseModel):
+    web_url: AnyHttpUrl | None = None
+    display_name: str | None = Field(None, max_length=500)
+    application_name: str | None = Field(None, max_length=255)
+    external_id: str | None = Field(None, max_length=255)
+
+
+class LinkedResourceOut(BaseModel):
+    id: uuid.UUID
+    task_id: uuid.UUID
+    ms_id: str | None = None
+    web_url: str
+    display_name: str
+    application_name: str | None = None
+    external_id: str | None = None
+    sync_status: str
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+# --- F2.2: TaskAttachment ---
+
+class AttachmentOut(BaseModel):
+    id: uuid.UUID
+    task_id: uuid.UUID
+    ms_id: str | None = None
+    name: str
+    content_type: str | None = None
+    size_bytes: int | None = None
+    reference_url: str | None = None
+    sync_status: str
+    created_at: datetime
+    # content_bytes NOT exposed here — use /attachments/{id}/content
+
+    model_config = {"from_attributes": True}
+
+
+class AttachmentContentOut(AttachmentOut):
+    """Full response including base64-encoded content_bytes."""
+    content_base64: str | None = None
+
+
+# --- F3.3: Share list ---
+
+from pydantic import EmailStr
+
+
+class ShareListIn(BaseModel):
+    """Body for POST /lists/{list_id}/share."""
+    email: EmailStr
+    permission: Literal["read", "readwrite"] = "readwrite"
+
+
+class ShareListOut(BaseModel):
+    """Response from POST /lists/{list_id}/share — invitation info from Graph."""
+    invited_user_email: str | None = None
+    permission: str
+    raw: dict | None = None

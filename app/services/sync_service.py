@@ -6,7 +6,7 @@ from sqlalchemy import select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import async_session
-from app.models import SyncLog, SyncState, Task, TaskList
+from app.models import LinkedResource, SyncLog, SyncState, Task, TaskAttachment, TaskList
 from app.services.graph_client import DeltaLinkExpiredError, graph_client
 
 logger = logging.getLogger(__name__)
@@ -164,17 +164,27 @@ async def pull_tasks_for_list(db: AsyncSession, task_list: TaskList) -> tuple[in
     resource_type = f"tasks:{task_list.ms_id}"
     state = await _get_or_create_sync_state(db, resource_type)
 
+    # F3.6: increment delta attempt counter before each delta call
+    state.delta_syncs_total = (state.delta_syncs_total or 0) + 1
+    _delta_full_reset = False
     try:
         delta_result = await graph_client.get_tasks_delta(task_list.ms_id, state.delta_link)
+        state.delta_syncs_succeeded = (state.delta_syncs_succeeded or 0) + 1
     except DeltaLinkExpiredError:
         logger.warning("Tasks delta link expired for list %s, doing full pull", task_list.ms_id)
         state.delta_link = None
+        state.delta_full_resets_total = (state.delta_full_resets_total or 0) + 1
+        _delta_full_reset = True
         delta_result = await graph_client.get_tasks_delta(task_list.ms_id, None)
+        state.delta_syncs_succeeded = (state.delta_syncs_succeeded or 0) + 1
     except Exception as e:
         if "400" in str(e) and state.delta_link:
             logger.warning("Bad delta link for list %s, resetting and retrying", task_list.ms_id)
             state.delta_link = None
+            state.delta_full_resets_total = (state.delta_full_resets_total or 0) + 1
+            _delta_full_reset = True
             delta_result = await graph_client.get_tasks_delta(task_list.ms_id, None)
+            state.delta_syncs_succeeded = (state.delta_syncs_succeeded or 0) + 1
         else:
             raise
 
@@ -238,6 +248,8 @@ async def pull_tasks_for_list(db: AsyncSession, task_list: TaskList) -> tuple[in
             "categories": item.get("categories", []),
             "ms_created_at": _parse_datetime(item.get("createdDateTime")),
             "ms_last_modified": ms_modified,
+            # F3.5: hasAttachments from Graph delta response
+            "has_attachments": bool(item.get("hasAttachments", False)),
         }
 
         if existing:
@@ -276,6 +288,90 @@ async def pull_tasks_for_list(db: AsyncSession, task_list: TaskList) -> tuple[in
         task = result.scalar_one_or_none()
         if task and task.sync_status != "pending_push":
             task.checklist_items = items
+
+    # F2.5: Pull linked_resources for changed tasks
+    for task_ms_id in upserted_ms_ids:
+        try:
+            lr_items = await graph_client.list_linked_resources(task_list.ms_id, task_ms_id)
+        except Exception as e:
+            logger.warning("Failed to fetch linkedResources for task %s: %s", task_ms_id, e)
+            continue
+        result = await db.execute(select(Task).where(Task.ms_id == task_ms_id))
+        task = result.scalar_one_or_none()
+        if not task:
+            continue
+        remote_lr_ids = {lr.get("id") for lr in lr_items if lr.get("id")}
+        existing_lrs = await db.execute(
+            select(LinkedResource).where(LinkedResource.task_id == task.id)
+        )
+        existing_by_ms_id = {lr.ms_id: lr for lr in existing_lrs.scalars().all() if lr.ms_id}
+        # Upsert
+        for lr_data in lr_items:
+            ms_id = lr_data.get("id")
+            if not ms_id:
+                continue
+            if ms_id in existing_by_ms_id:
+                lr = existing_by_ms_id[ms_id]
+                lr.web_url = lr_data.get("webUrl", lr.web_url)
+                lr.display_name = lr_data.get("displayName", lr.display_name)
+                lr.application_name = lr_data.get("applicationName")
+                lr.external_id = lr_data.get("externalId")
+                lr.sync_status = "synced"
+            else:
+                new_lr = LinkedResource(
+                    task_id=task.id,
+                    ms_id=ms_id,
+                    web_url=lr_data.get("webUrl", ""),
+                    display_name=lr_data.get("displayName", ""),
+                    application_name=lr_data.get("applicationName"),
+                    external_id=lr_data.get("externalId"),
+                    sync_status="synced",
+                )
+                db.add(new_lr)
+        # Remove deleted
+        for ms_id, lr in existing_by_ms_id.items():
+            if ms_id not in remote_lr_ids:
+                await db.delete(lr)
+
+    # F2.5: Pull attachments for tasks that have hasAttachments=True
+    # (Graph does not support $expand=attachments in delta/list queries)
+    tasks_with_attachments = [
+        item["id"] for item in delta_result["value"]
+        if not item.get("@removed") and item.get("hasAttachments") and item.get("id")
+    ]
+    for task_ms_id in tasks_with_attachments:
+        try:
+            att_items = await graph_client.list_attachments(task_list.ms_id, task_ms_id)
+        except Exception as e:
+            logger.warning("Failed to fetch attachments for task %s: %s", task_ms_id, e)
+            continue
+        result = await db.execute(select(Task).where(Task.ms_id == task_ms_id))
+        task = result.scalar_one_or_none()
+        if not task:
+            continue
+        remote_att_ids = {a.get("id") for a in att_items if a.get("id")}
+        existing_atts = await db.execute(
+            select(TaskAttachment).where(TaskAttachment.task_id == task.id)
+        )
+        existing_by_ms_id = {a.ms_id: a for a in existing_atts.scalars().all() if a.ms_id}
+        for att_data in att_items:
+            ms_id = att_data.get("id")
+            if not ms_id:
+                continue
+            if ms_id not in existing_by_ms_id:
+                new_att = TaskAttachment(
+                    task_id=task.id,
+                    ms_id=ms_id,
+                    name=att_data.get("name", "attachment"),
+                    content_type=att_data.get("contentType"),
+                    size_bytes=att_data.get("size"),
+                    sync_status="synced",
+                )
+                db.add(new_att)
+        # Remove deleted
+        for ms_id, att in existing_by_ms_id.items():
+            if ms_id not in remote_att_ids:
+                await db.delete(att)
 
     state.delta_link = delta_result.get("delta_link")
     state.last_sync_at = datetime.now(timezone.utc)
@@ -429,6 +525,72 @@ async def push_pending(db: AsyncSession) -> tuple[int, int]:
                     pushed_tasks += 1
                 except Exception:
                     logger.exception("Failed to delete task %s from Graph", task.id)
+
+    # F2.5: Push pending linked_resources
+    lr_result = await db.execute(
+        select(LinkedResource).where(LinkedResource.sync_status == "pending")
+    )
+    for lr in lr_result.scalars().all():
+        task_result = await db.execute(select(Task).where(Task.id == lr.task_id))
+        task = task_result.scalar_one_or_none()
+        if not task or not task.ms_id:
+            continue
+        list_result = await db.execute(select(TaskList).where(TaskList.id == task.list_id))
+        task_list = list_result.scalar_one_or_none()
+        if not task_list or not task_list.ms_id:
+            continue
+        try:
+            resp = await graph_client.create_linked_resource(
+                task_list.ms_id,
+                task.ms_id,
+                {
+                    "webUrl": lr.web_url,
+                    "displayName": lr.display_name,
+                    **({"applicationName": lr.application_name} if lr.application_name else {}),
+                    **({"externalId": lr.external_id} if lr.external_id else {}),
+                },
+            )
+            lr.ms_id = resp.get("id")
+            lr.sync_status = "synced"
+        except Exception:
+            logger.exception("Failed to push linked_resource %s to Graph", lr.id)
+            lr.sync_status = "failed"
+
+    # F2.5: Push pending attachments (file attachments only; reference attachments are local-only)
+    att_result = await db.execute(
+        select(TaskAttachment).where(
+            TaskAttachment.sync_status == "pending",
+            TaskAttachment.content_bytes.is_not(None),
+        )
+    )
+    import base64 as _base64
+    for att in att_result.scalars().all():
+        task_result = await db.execute(select(Task).where(Task.id == att.task_id))
+        task = task_result.scalar_one_or_none()
+        if not task or not task.ms_id:
+            continue
+        list_result = await db.execute(select(TaskList).where(TaskList.id == task.list_id))
+        task_list = list_result.scalar_one_or_none()
+        if not task_list or not task_list.ms_id:
+            continue
+        try:
+            resp = await graph_client.create_attachment(
+                task_list.ms_id,
+                task.ms_id,
+                {
+                    "@odata.type": "#microsoft.graph.taskFileAttachment",
+                    "name": att.name,
+                    "contentType": att.content_type or "application/octet-stream",
+                    "contentBytes": _base64.b64encode(att.content_bytes).decode("ascii"),
+                    "size": att.size_bytes or len(att.content_bytes),
+                },
+            )
+            att.ms_id = resp.get("id")
+            att.sync_status = "synced"
+        except Exception:
+            logger.exception("Failed to push attachment %s to Graph", att.id)
+            att.sync_status = "failed"
+            # Continue with next attachment - failed attachment does not block others
 
     return pushed_lists, pushed_tasks
 
