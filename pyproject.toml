@@ -1,6 +1,6 @@
 [project]
 name = "todo-sync"
-version = "0.2.0"
+version = "0.3.0"
 description = "Bidirectional sync service: Microsoft To Do ↔ PostgreSQL with REST API"
 requires-python = ">=3.12"
 dependencies = [
