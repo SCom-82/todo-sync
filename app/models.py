@@ -58,6 +58,10 @@ class Task(Base):
     status: Mapped[str] = mapped_column(String(20), default="notStarted")
     due_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     due_timezone: Mapped[str] = mapped_column(String(50), default="UTC")
+    # F1.2: full datetime with timezone support
+    due_datetime: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    start_datetime: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    start_timezone: Mapped[str | None] = mapped_column(String(50), nullable=True)
     reminder_datetime: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     is_reminder_on: Mapped[bool] = mapped_column(Boolean, default=False)
     completed_datetime: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

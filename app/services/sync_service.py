@@ -43,6 +43,27 @@ def _parse_date(dt_obj: dict | None):
     return dt_local.date(), tz
 
 
+def _parse_dt_obj(dt_obj: dict | None) -> tuple[datetime | None, str | None]:
+    """Parse Graph dateTimeTimeZone into (tz-aware datetime, tz name).
+
+    Returns (None, None) if dt_obj is empty or invalid.
+    Unlike _parse_date, preserves full datetime precision for F1.2 write-path parity.
+    """
+    if not dt_obj or not isinstance(dt_obj, dict):
+        return None, None
+    raw = dt_obj.get("dateTime") or ""
+    tz = dt_obj.get("timeZone")
+    if not raw:
+        return None, tz
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None, tz
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt, tz
+
+
 async def _get_or_create_sync_state(db: AsyncSession, resource_type: str) -> SyncState:
     result = await db.execute(select(SyncState).where(SyncState.resource_type == resource_type))
     state = result.scalar_one_or_none()
@@ -179,6 +200,8 @@ async def pull_tasks_for_list(db: AsyncSession, task_list: TaskList) -> tuple[in
         if raw_due:
             logger.info("RAW dueDateTime for '%s': %s", item.get("title", "?")[:50], raw_due)
         due_date, due_tz = _parse_date(raw_due)
+        due_dt, _ = _parse_dt_obj(raw_due)
+        start_dt, start_tz = _parse_dt_obj(item.get("startDateTime"))
         reminder_dt_raw = item.get("reminderDateTime")
         reminder_dt = None
         if reminder_dt_raw and isinstance(reminder_dt_raw, dict):
@@ -204,6 +227,9 @@ async def pull_tasks_for_list(db: AsyncSession, task_list: TaskList) -> tuple[in
             "status": item.get("status", "notStarted"),
             "due_date": due_date,
             "due_timezone": due_tz,
+            "due_datetime": due_dt,
+            "start_datetime": start_dt,
+            "start_timezone": start_tz,
             "reminder_datetime": reminder_dt,
             "is_reminder_on": item.get("isReminderOn", False),
             "completed_datetime": completed_dt,

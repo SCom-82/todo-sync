@@ -1,6 +1,6 @@
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -13,6 +13,31 @@ router = APIRouter(prefix="/lists", tags=["task_lists"])
 @router.get("", response_model=list[TaskListResponse])
 async def list_task_lists(db: AsyncSession = Depends(get_db)):
     return await task_service.get_all_lists(db)
+
+
+@router.get("/resolve", response_model=TaskListResponse)
+async def resolve_task_list(
+    name: str = Query(..., description="Точное отображаемое имя списка"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Найти список по display_name. 200 — exact match, 404 — не найден, 409 — дубликат."""
+    from sqlalchemy import select
+    from app.models import TaskList
+    result = await db.execute(
+        select(TaskList).where(
+            TaskList.display_name == name,
+            TaskList.deleted_at.is_(None),
+        )
+    )
+    matches = result.scalars().all()
+    if not matches:
+        raise HTTPException(status_code=404, detail=f"List '{name}' not found")
+    if len(matches) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Multiple lists named '{name}' found ({len(matches)}). Use list_id instead.",
+        )
+    return matches[0]
 
 
 @router.post("", response_model=TaskListResponse, status_code=201)
