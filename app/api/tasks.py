@@ -54,7 +54,11 @@ async def create_task(data: TaskCreate, db: AsyncSession = Depends(get_db)):
     try:
         return await task_service.create_task(db, data)
     except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        msg = str(e)
+        # recurrence-without-dueDateTime → 422 (our validation, not a 404)
+        if "recurring" in msg.lower() or "recurrence" in msg.lower() or "dueDateTime" in msg:
+            raise HTTPException(status_code=422, detail=msg)
+        raise HTTPException(status_code=404, detail=msg)
 
 
 @router.get("/{task_id}", response_model=TaskResponse)

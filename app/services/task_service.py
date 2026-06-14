@@ -65,29 +65,47 @@ async def _resolve_list(db: AsyncSession, data: TaskCreate) -> TaskList:
 
 
 def _recurrence_to_graph(rec: PatternedRecurrence) -> dict:
-    """Serialize PatternedRecurrence to MS Graph patternedRecurrence payload."""
+    """Serialize PatternedRecurrence to MS Graph patternedRecurrence payload.
+
+    Emits ONLY populated non-sentinel sub-fields (empirically: 1b contract).
+    Graph backfills sentinels in responses (month=0, daysOfWeek=[], endDate="0001-01-01", …)
+    — those must NOT be re-sent or Graph returns HTTP 400 on Nullable=False fields.
+    """
     pattern: dict = {
         "type": rec.pattern.type,
         "interval": rec.pattern.interval,
     }
-    if rec.pattern.daysOfWeek is not None:
+    # daysOfWeek: skip empty list (Graph sentinel) and None
+    if rec.pattern.daysOfWeek:  # truthy = non-empty list
         pattern["daysOfWeek"] = rec.pattern.daysOfWeek
+    # firstDayOfWeek: Graph sets "sunday" as sentinel for non-weekly types; only include if explicitly set
+    # and pattern type warrants it (weekly uses firstDayOfWeek meaningfully)
     if rec.pattern.firstDayOfWeek is not None:
-        pattern["firstDayOfWeek"] = rec.pattern.firstDayOfWeek
+        pt = rec.pattern.type
+        if pt == "weekly" or rec.pattern.firstDayOfWeek != "sunday":
+            # Include if it's a weekly pattern OR if caller set a non-sentinel value
+            pattern["firstDayOfWeek"] = rec.pattern.firstDayOfWeek
+    # index: Graph sets "first" as sentinel for non-relative types
     if rec.pattern.index is not None:
-        pattern["index"] = rec.pattern.index
-    if rec.pattern.dayOfMonth is not None:
+        pt = rec.pattern.type
+        if pt in ("relativeMonthly", "relativeYearly") or rec.pattern.index != "first":
+            pattern["index"] = rec.pattern.index
+    # dayOfMonth: 0 is Graph sentinel
+    if rec.pattern.dayOfMonth is not None and rec.pattern.dayOfMonth != 0:
         pattern["dayOfMonth"] = rec.pattern.dayOfMonth
-    if rec.pattern.month is not None:
+    # month: 0 is Graph sentinel
+    if rec.pattern.month is not None and rec.pattern.month != 0:
         pattern["month"] = rec.pattern.month
 
     rng: dict = {
         "type": rec.range.type,
         "startDate": rec.range.startDate,
     }
-    if rec.range.endDate is not None:
+    # endDate: "0001-01-01" is Graph sentinel for noEnd ranges
+    if rec.range.endDate is not None and rec.range.endDate != "0001-01-01":
         rng["endDate"] = rec.range.endDate
-    if rec.range.numberOfOccurrences is not None:
+    # numberOfOccurrences: 0 is Graph sentinel
+    if rec.range.numberOfOccurrences is not None and rec.range.numberOfOccurrences != 0:
         rng["numberOfOccurrences"] = rec.range.numberOfOccurrences
 
     return {"pattern": pattern, "range": rng}
@@ -131,9 +149,50 @@ def _task_to_graph_payload(task: Task) -> dict:
     if task.categories:
         payload["categories"] = task.categories
 
-    # F1.4: recurrence — stored as dict in JSONB, pass through as-is
+    # F1.4: recurrence — build clean payload (no null sub-fields → Graph 400).
+    # Stored as raw JSONB dict from Graph (may contain sentinel values like month=0,
+    # endDate="0001-01-01", daysOfWeek=[] that Graph backfills on pull).
+    # We re-serialize using _recurrence_to_graph to emit only populated fields.
     if task.recurrence:
-        payload["recurrence"] = task.recurrence
+        try:
+            from app.schemas import PatternedRecurrence
+            rec_obj = PatternedRecurrence.model_validate(task.recurrence)
+            payload["recurrence"] = _recurrence_to_graph(rec_obj)
+        except Exception:
+            # If stored dict does not match schema (e.g. sentinel-heavy pull data),
+            # fall back to a minimal clean rebuild from raw dict to strip nulls.
+            rec = task.recurrence
+            pattern_raw = rec.get("pattern", {}) if isinstance(rec, dict) else {}
+            range_raw = rec.get("range", {}) if isinstance(rec, dict) else {}
+            pattern_out: dict = {}
+            for k in ("type", "interval", "daysOfWeek", "firstDayOfWeek", "index", "dayOfMonth", "month"):
+                v = pattern_raw.get(k)
+                # Skip None and sentinel values that Graph backfills
+                if v is None:
+                    continue
+                if k == "daysOfWeek" and v == []:
+                    continue
+                if k in ("month", "dayOfMonth") and v == 0:
+                    continue
+                if k == "index" and v == "first":
+                    # "first" is a sentinel Graph adds; keep only if pattern type is relativeMonthly/relativeYearly
+                    pt = pattern_raw.get("type", "")
+                    if pt not in ("relativeMonthly", "relativeYearly"):
+                        continue
+                pattern_out[k] = v
+            range_out: dict = {}
+            for k in ("type", "startDate"):
+                v = range_raw.get(k)
+                if v is not None:
+                    range_out[k] = v
+            end_date = range_raw.get("endDate")
+            if end_date and end_date != "0001-01-01":
+                range_out["endDate"] = end_date
+            num_occ = range_raw.get("numberOfOccurrences")
+            if num_occ is not None and num_occ != 0:
+                range_out["numberOfOccurrences"] = num_occ
+            if pattern_out and range_out:
+                payload["recurrence"] = {"pattern": pattern_out, "range": range_out}
 
     return payload
 
@@ -278,31 +337,67 @@ async def get_task(db: AsyncSession, task_id: uuid.UUID) -> Task | None:
     return result.scalar_one_or_none()
 
 
-async def _try_push_task(task: Task, list_ms_id: str | None, action: str) -> None:
-    """Best-effort immediate push to MS Graph. Failures are retried by periodic sync."""
+def _validate_graph_id(resp: dict) -> str | None:
+    """Return Graph id from response if it looks like a valid Graph base64 id, else None.
+
+    Graph IDs are base64-encoded strings, typically 100+ chars. Local UUIDs (36 chars with dashes)
+    indicate the push silently failed and the response did not return a real Graph id.
+    """
+    id_val = resp.get("id")
+    if not id_val or not isinstance(id_val, str):
+        return None
+    # UUID4 format = 8-4-4-4-12 hex with dashes (36 chars). Graph IDs are much longer.
+    import re as _re
+    if _re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", id_val, _re.IGNORECASE):
+        return None  # local UUID, not a real Graph id
+    return id_val
+
+
+async def _try_push_task(task: Task, list_ms_id: str | None, action: str) -> bool:
+    """Best-effort immediate push to MS Graph. Returns True on success, False on failure.
+
+    P0 push-verify: non-2xx responses and exceptions keep task in pending_push (not synced).
+    Graph response body is validated — synced is only set when a real Graph id is confirmed.
+    """
     if not list_ms_id:
-        return
+        return False
     try:
         if action == "create":
             data = _task_to_graph_payload(task)
             result = graph_client.create_task(list_ms_id, data)
             if asyncio.iscoroutine(result):
                 result = await result
-            task.ms_id = result.get("id")
+            graph_id = _validate_graph_id(result)
+            if not graph_id:
+                logger.error(
+                    "Push create task %s: Graph response missing valid id (got %r). "
+                    "Task stays pending_push.",
+                    task.id, result.get("id"),
+                )
+                return False
+            task.ms_id = graph_id
             task.sync_status = "synced"
+            return True
         elif action == "update" and task.ms_id:
             data = _task_to_graph_payload(task)
             result = graph_client.update_task(list_ms_id, task.ms_id, data)
             if asyncio.iscoroutine(result):
-                await result
+                result = await result
             task.sync_status = "synced"
+            return True
         elif action == "delete" and task.ms_id:
             result = graph_client.delete_task(list_ms_id, task.ms_id)
             if asyncio.iscoroutine(result):
                 await result
             task.sync_status = "synced"
+            return True
     except Exception:
-        logger.exception("Failed to push task %s to Graph, will retry on next sync", task.id)
+        logger.exception(
+            "Failed to push task %s (action=%s) to Graph, will retry on next sync",
+            task.id, action,
+        )
+    # On any failure: leave sync_status as pending_push (caller must NOT set synced).
+    return False
 
 
 async def _try_push_checklist_items(task: Task, list_ms_id: str | None) -> None:
@@ -316,9 +411,30 @@ async def _try_push_checklist_items(task: Task, list_ms_id: str | None) -> None:
         logger.exception("Failed to push checklist items for task %s, will retry on next sync", task.id)
 
 
+def _validate_recurrence_has_due(
+    recurrence: object | None,
+    due_datetime: object | None,
+    due_date: object | None,
+) -> None:
+    """Raise ValueError if recurrence is set but no dueDateTime/due_date provided.
+
+    Graph requires dueDateTime for any recurring task (empirically: HTTP 400,
+    'The property dueDateTime is required when creating recurrence in the task entity').
+    We enforce this on our side so we never send a guaranteed-to-fail payload.
+    """
+    if recurrence is not None and due_datetime is None and due_date is None:
+        raise ValueError(
+            "A recurring task requires dueDateTime (or due_date). "
+            "Graph rejects recurring tasks without dueDateTime with HTTP 400."
+        )
+
+
 async def create_task(db: AsyncSession, data: TaskCreate) -> Task:
     # F1.1: resolve list by name or ms_id
     task_list = await _resolve_list(db, data)
+
+    # Validate: recurring task must have dueDateTime
+    _validate_recurrence_has_due(data.recurrence, data.due_datetime, data.due_date)
 
     # F1.2: compute due_date from due_datetime if needed
     resolved_due_date = data.due_date
@@ -407,7 +523,20 @@ async def complete_task(db: AsyncSession, task_id: uuid.UUID) -> Task | None:
 
     list_result = await db.execute(select(TaskList).where(TaskList.id == task.list_id))
     task_list = list_result.scalar_one_or_none()
-    await _try_push_task(task, task_list.ms_id if task_list else None, "update")
+
+    push_succeeded = await _try_push_task(task, task_list.ms_id if task_list else None, "update")
+
+    # ADR §3: for recurring tasks, do NOT mark synced after immediate push even if it succeeded.
+    # Graph auto-advances the series (A: same id flips to notStarted with new dueDateTime) and
+    # spawns a sibling (B: new id with completed status). The next pull must handle this
+    # gracefully — conflict-guard needs the task in pending_push (not synced) to trigger.
+    if push_succeeded and task.recurrence:
+        task.sync_status = "pending_push"
+        logger.debug(
+            "complete_task %s: recurring — keeping pending_push after push (ADR §3, conflict-guard)",
+            task.id,
+        )
+
     await db.commit()
     await db.refresh(task)
     return task
