@@ -1,4 +1,6 @@
-from fastapi import APIRouter, Depends, Query
+import traceback
+
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -12,8 +14,14 @@ router = APIRouter(prefix="/sync", tags=["sync"])
 
 @router.post("/trigger")
 async def trigger_sync():
-    result = await sync_service.run_sync(sync_type="manual")
-    return result
+    # Wrap run_sync so that exceptions are returned as 500 with a readable detail message
+    # instead of an empty FastAPI "Internal Server Error" (ticket c health diagnosis).
+    try:
+        result = await sync_service.run_sync(sync_type="manual")
+        return result
+    except Exception as exc:
+        tb = traceback.format_exc()
+        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}\n\n{tb}") from exc
 
 
 @router.post("/reset")
@@ -49,9 +57,13 @@ async def get_sync_status(db: AsyncSession = Depends(get_db)):
         total_delta_syncs += s.delta_syncs_total or 0
         total_delta_succeeded += s.delta_syncs_succeeded or 0
         total_full_resets += s.delta_full_resets_total or 0
-    skip_rate = 0.0
+    # delta_success_rate_pct: fraction of delta syncs where Graph returned a valid delta
+    # response (not a full reset). 100% = all syncs used delta link successfully; 0% = every
+    # sync triggered a full reset. Renamed from delta_skip_rate_pct (was inverted: showed
+    # success rate but the field was named "skip rate", causing confusion in ADR health-signal).
+    success_rate = 0.0
     if total_delta_syncs > 0:
-        skip_rate = round((total_delta_succeeded / total_delta_syncs) * 100, 2)
+        success_rate = round((total_delta_succeeded / total_delta_syncs) * 100, 2)
     return SyncStatusResponse(
         last_sync_at=last_sync_at,
         last_sync_status=last_status,
@@ -59,7 +71,7 @@ async def get_sync_status(db: AsyncSession = Depends(get_db)):
         delta_syncs_total=total_delta_syncs,
         delta_syncs_succeeded=total_delta_succeeded,
         delta_full_resets_total=total_full_resets,
-        delta_skip_rate_pct=skip_rate,
+        delta_success_rate_pct=success_rate,
     )
 
 

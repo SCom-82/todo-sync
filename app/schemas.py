@@ -254,7 +254,10 @@ class SyncStatusResponse(BaseModel):
     delta_syncs_total: int = 0
     delta_syncs_succeeded: int = 0
     delta_full_resets_total: int = 0
-    delta_skip_rate_pct: float = 0.0
+    # delta_success_rate_pct: percentage of delta syncs that returned a valid delta response
+    # (vs full resets / errors). 100% = all delta syncs used the delta link successfully.
+    # Renamed from delta_skip_rate_pct (was inverted — showed success rate as "skip rate").
+    delta_success_rate_pct: float = 0.0
 
 
 class SyncLogEntry(BaseModel):

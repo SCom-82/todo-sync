@@ -81,6 +81,18 @@ class Task(Base):
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     sync_status: Mapped[str] = mapped_column(String(20), default="synced")
 
+    # --- Recurring completion tracking (ADR 2026-06-14) ---
+    # last_completed_occurrence_date: completion-intent marker for conflict-guard.
+    # Set to the dueDate of the occurrence we just completed. Used to distinguish
+    # "Graph auto-advanced series" (dueDate shifted forward) from "real uncomplete".
+    # NOT a history mechanism — completed siblings carry history (ADR §2b / variant C').
+    last_completed_occurrence_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+
+    # local_modified_at: moment of last local change (set by app on create/update/complete/uncomplete).
+    # Used as conflict-guard comparator instead of updated_at (which is COMMIT time, not user action time).
+    # Backfill: updated_at for existing rows (ADR §1).
+    local_modified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     task_list: Mapped["TaskList"] = relationship("TaskList", back_populates="tasks")
     linked_resources: Mapped[list["LinkedResource"]] = relationship("LinkedResource", back_populates="task", cascade="all, delete-orphan", lazy="selectin")
     attachments: Mapped[list["TaskAttachment"]] = relationship("TaskAttachment", back_populates="task", cascade="all, delete-orphan", lazy="selectin")

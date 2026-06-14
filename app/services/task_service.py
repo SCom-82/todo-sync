@@ -446,6 +446,7 @@ async def create_task(db: AsyncSession, data: TaskCreate) -> Task:
         except Exception:
             resolved_due_date = data.due_datetime.date()
 
+    now_utc = datetime.now(timezone.utc)
     task = Task(
         list_id=task_list.id,
         title=data.title,
@@ -463,6 +464,7 @@ async def create_task(db: AsyncSession, data: TaskCreate) -> Task:
         checklist_items=[it.model_dump() for it in data.checklist_items],
         recurrence=data.recurrence.model_dump() if data.recurrence else None,  # F1.4
         sync_status="pending_push",
+        local_modified_at=now_utc,  # ADR §1: track local change time for conflict-guard
     )
     db.add(task)
     await db.flush()
@@ -501,6 +503,7 @@ async def update_task(db: AsyncSession, task_id: uuid.UUID, data: TaskUpdate) ->
     for field, value in update_fields.items():
         setattr(task, field, value)
     task.sync_status = "pending_push"
+    task.local_modified_at = datetime.now(timezone.utc)  # ADR §1: conflict-guard comparator
 
     list_result = await db.execute(select(TaskList).where(TaskList.id == task.list_id))
     task_list = list_result.scalar_one_or_none()
@@ -517,9 +520,21 @@ async def complete_task(db: AsyncSession, task_id: uuid.UUID) -> Task | None:
     task = await get_task(db, task_id)
     if not task:
         return None
+    now_utc = datetime.now(timezone.utc)
     task.status = "completed"
-    task.completed_datetime = datetime.now(timezone.utc)
+    task.completed_datetime = now_utc
     task.sync_status = "pending_push"
+    task.local_modified_at = now_utc  # ADR §1: conflict-guard comparator
+
+    # ADR §2: set completion-intent marker for conflict-guard.
+    # Records which dueDate occurrence we just completed. On next pull, if Graph sends
+    # the same ms_id in notStarted with dueDate shifted FORWARD — that's auto-advance, not uncomplete.
+    if task.recurrence and task.due_date:
+        task.last_completed_occurrence_date = task.due_date
+        logger.debug(
+            "complete_task %s: recurring — setting last_completed_occurrence_date=%s",
+            task.id, task.due_date,
+        )
 
     list_result = await db.execute(select(TaskList).where(TaskList.id == task.list_id))
     task_list = list_result.scalar_one_or_none()
@@ -549,6 +564,9 @@ async def uncomplete_task(db: AsyncSession, task_id: uuid.UUID) -> Task | None:
     task.status = "notStarted"
     task.completed_datetime = None
     task.sync_status = "pending_push"
+    task.local_modified_at = datetime.now(timezone.utc)  # ADR §1
+    # Clear intent marker on local uncomplete
+    task.last_completed_occurrence_date = None
 
     list_result = await db.execute(select(TaskList).where(TaskList.id == task.list_id))
     task_list = list_result.scalar_one_or_none()
