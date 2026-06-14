@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models import LinkedResource
 from app.schemas import LinkedResourceIn, LinkedResourceUpdate
 from app.services.graph_client import graph_client
+from app.services.graph_id import is_present_id
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +26,9 @@ async def create(db: AsyncSession, task_id: uuid.UUID, data: LinkedResourceIn) -
     db.add(lr)
     await db.flush()
 
-    # Best-effort push to Graph
+    # Best-effort push to Graph — only when the parent task already has a Graph id.
+    # RC-A1 fix: if task.ms_id is None (task not yet synced), skip push silently;
+    # push-loop in sync_service will pick it up when the task gets synced.
     from app.models import Task, TaskList
     from sqlalchemy import select as sa_select
     result = await db.execute(sa_select(Task).where(Task.id == task_id))
@@ -45,10 +48,24 @@ async def create(db: AsyncSession, task_id: uuid.UUID, data: LinkedResourceIn) -
                         **({"externalId": data.external_id} if data.external_id else {}),
                     },
                 )
-                lr.ms_id = resp.get("id")
-                lr.sync_status = "synced"
+                # RC-A fix: set synced ONLY after verifying that Graph returned a real id.
+                # For linkedResources, Graph returns a GUID (not base64) — use is_present_id,
+                # NOT is_task_graph_id which would wrongly reject GUID-shaped ids.
+                gid = is_present_id(resp)
+                if gid:
+                    lr.ms_id = gid
+                    lr.sync_status = "synced"
+                else:
+                    logger.error(
+                        "Graph returned 2xx for linked_resource create but no id in response "
+                        "(task=%s). Leaving status=pending for retry.", task_id
+                    )
+                    lr.sync_status = "pending"
+                    lr.ms_id = None
             except Exception:
                 logger.exception("Failed to push linked_resource to Graph for task %s", task_id)
+                lr.sync_status = "pending"
+                lr.ms_id = None
 
     await db.commit()
     await db.refresh(lr)
@@ -102,6 +119,8 @@ async def update(db: AsyncSession, lr_id: uuid.UUID, data: LinkedResourceUpdate)
                         )
                 except Exception:
                     logger.exception("Failed to push linked_resource update to Graph %s", lr_id)
+                    # On update failure, leave existing ms_id intact (resource exists in Graph).
+                    # The local record is updated; sync may reconcile on next pull.
 
     await db.commit()
     await db.refresh(lr)
