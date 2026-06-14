@@ -75,7 +75,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     created_at TEXT DEFAULT (datetime('now')),
     updated_at TEXT DEFAULT (datetime('now')),
     deleted_at TEXT,
-    sync_status TEXT NOT NULL DEFAULT 'synced'
+    sync_status TEXT NOT NULL DEFAULT 'synced',
+    last_completed_occurrence_date TEXT,
+    local_modified_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS sync_state (

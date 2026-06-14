@@ -206,19 +206,19 @@ class TestSyncStatusMetrics:
         assert s.delta_syncs_total == 0
         assert s.delta_syncs_succeeded == 0
         assert s.delta_full_resets_total == 0
-        assert s.delta_skip_rate_pct == 0.0
+        assert s.delta_success_rate_pct == 0.0
 
     def test_metrics_set_correctly(self):
         from app.schemas import SyncStatusResponse
         s = SyncStatusResponse(
             last_sync_at=None, last_sync_status=None, resources=[],
             delta_syncs_total=10, delta_syncs_succeeded=8,
-            delta_full_resets_total=2, delta_skip_rate_pct=80.0,
+            delta_full_resets_total=2, delta_success_rate_pct=80.0,
         )
         assert s.delta_syncs_total == 10
         assert s.delta_syncs_succeeded == 8
         assert s.delta_full_resets_total == 2
-        assert s.delta_skip_rate_pct == 80.0
+        assert s.delta_success_rate_pct == 80.0
 
 
 # ─────────────────────────────────────────────

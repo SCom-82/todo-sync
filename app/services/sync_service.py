@@ -253,14 +253,79 @@ async def pull_tasks_for_list(db: AsyncSession, task_list: TaskList) -> tuple[in
         }
 
         if existing:
-            if existing.sync_status == "pending_push" and existing.updated_at and ms_modified:
-                if existing.updated_at > ms_modified:
-                    continue
+            # ADR 2026-06-14 §1: use local_modified_at (app-set) instead of updated_at
+            # (COMMIT time) for conflict-guard comparison. Falls back to updated_at for
+            # older rows without local_modified_at (backfill = updated_at per migration).
+            local_modified = getattr(existing, "local_modified_at", None) or existing.updated_at
+
+            if existing.sync_status == "pending_push" and local_modified and ms_modified:
+                if local_modified > ms_modified:
+                    # Local change is newer than Graph's — skip this pull update.
+                    # EXCEPTION: recurring series auto-advance (ADR §2, gybrid A+B).
+                    # When we complete a recurring task, Graph flips the same ms_id back to
+                    # notStarted with dueDateTime shifted forward. This is NOT an uncomplete —
+                    # it's normal series behavior. We must handle it, not skip it.
+                    # We check for this below in the recurring conflict-guard block.
+                    # For non-recurring tasks in pending_push that are locally newer: skip.
+                    if not existing.recurrence:
+                        continue
+                    # For recurring: fall through to the recurring conflict-guard below.
+
+            # ADR §2: completed-intent protection for recurring series (branch A).
+            # Only applies when existing.recurrence IS NOT NULL (never mislabels non-recurring uncomplete).
+            if existing.recurrence and existing.sync_status == "pending_push":
+                incoming_status = item.get("status", "notStarted")
+                incoming_due_date = due_date  # already parsed above
+
+                if incoming_status == "notStarted" and incoming_due_date:
+                    # Graph sent notStarted on a recurring series we have in pending_push.
+                    # Distinguish: auto-advance (dueDate shifted forward) vs real uncomplete (same/backward date).
+                    completed_intent = getattr(existing, "last_completed_occurrence_date", None)
+
+                    if completed_intent and incoming_due_date > completed_intent:
+                        # Auto-advance: Graph rolled the series to the next occurrence.
+                        # Accept the new dueDate and notStarted status, but treat this as
+                        # expected series behavior — NOT an uncomplete. Clear intent marker.
+                        logger.debug(
+                            "pull recurring %s: auto-advance detected — "
+                            "dueDate %s→%s, accepting series roll-forward (ADR §2)",
+                            ms_id, completed_intent, incoming_due_date,
+                        )
+                        # Update only the date/status fields from Graph; clear intent marker
+                        existing.due_date = due_date
+                        existing.due_datetime = due_dt
+                        existing.due_timezone = due_tz
+                        existing.status = "notStarted"
+                        existing.completed_datetime = None
+                        existing.last_completed_occurrence_date = None
+                        existing.ms_last_modified = ms_modified
+                        existing.recurrence = item.get("recurrence", existing.recurrence)
+                        existing.sync_status = "synced"
+                        existing.deleted_at = None
+                        upserted += 1
+                        continue  # skip the full setattr below
+
+                    elif completed_intent and incoming_due_date <= completed_intent:
+                        # Real uncomplete: user removed completion in another client.
+                        # Date not shifted forward — accept it as genuine uncomplete.
+                        logger.debug(
+                            "pull recurring %s: real uncomplete detected — "
+                            "dueDate %s unchanged, accepting notStarted (ADR §2)",
+                            ms_id, incoming_due_date,
+                        )
+                        existing.last_completed_occurrence_date = None
+                        # Fall through to full setattr below
+
+                    # If no completed_intent (no recent completion), treat as normal pull update.
+
             for key, value in task_data.items():
                 setattr(existing, key, value)
             existing.sync_status = "synced"
             existing.deleted_at = None
         else:
+            # ADR §2b: completed-sibling (branch B) — new ms_id with status=completed that
+            # Graph spawns when a recurring occurrence is completed. Ingest as a normal new
+            # completed task. No dedup with the series (different ms_id). History lives here.
             new_task = Task(
                 ms_id=ms_id,
                 list_id=task_list.id,
