@@ -585,7 +585,7 @@ class TestCompleteTaskSetsIntentMarker:
 
         # Simulate _try_push_task: for non-recurring, it will set task.sync_status = "synced"
         # (this is done inside _try_push_task for successful push)
-        async def fake_push(task_obj, list_ms_id, action):
+        async def fake_push(task_obj, list_ms_id, action, payload_override=None):
             if action == "update":
                 task_obj.sync_status = "synced"
             return True

@@ -111,6 +111,33 @@ def _recurrence_to_graph(rec: PatternedRecurrence) -> dict:
     return {"pattern": pattern, "range": rng}
 
 
+def _completion_patch_payload(task: Task) -> dict:
+    """Build a status-only PATCH payload for completion/uncomplete operations.
+
+    ADR §3 (completion-PATCH status-only, 2026-06-14): Graph returns HTTP 400 when a
+    recurring-task PATCH includes recurrence/dueDateTime alongside status. The minimal
+    status-only payload {"status":"completed","completedDateTime":{...}} → HTTP 200.
+    Applied to ALL tasks (recurring and non-recurring) for uniformity and safety.
+    """
+    if task.status == "completed" and task.completed_datetime:
+        dt = task.completed_datetime
+        # Ensure timezone-aware
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return {
+            "status": "completed",
+            "completedDateTime": {
+                "dateTime": dt.strftime("%Y-%m-%dT%H:%M:%S.0000000"),
+                "timeZone": "UTC",
+            },
+        }
+    # uncomplete: clear status and completedDateTime
+    return {
+        "status": "notStarted",
+        "completedDateTime": None,
+    }
+
+
 def _task_to_graph_payload(task: Task) -> dict:
     payload: dict = {"title": task.title, "importance": task.importance, "status": task.status}
 
@@ -353,7 +380,9 @@ def _validate_graph_id(resp: dict) -> str | None:
     return id_val
 
 
-async def _try_push_task(task: Task, list_ms_id: str | None, action: str) -> bool:
+async def _try_push_task(
+    task: Task, list_ms_id: str | None, action: str, payload_override: dict | None = None
+) -> bool:
     """Best-effort immediate push to MS Graph. Returns True on success, False on failure.
 
     P0 push-verify: non-2xx responses and exceptions keep task in pending_push (not synced).
@@ -363,7 +392,7 @@ async def _try_push_task(task: Task, list_ms_id: str | None, action: str) -> boo
         return False
     try:
         if action == "create":
-            data = _task_to_graph_payload(task)
+            data = payload_override if payload_override is not None else _task_to_graph_payload(task)
             result = graph_client.create_task(list_ms_id, data)
             if asyncio.iscoroutine(result):
                 result = await result
@@ -379,7 +408,7 @@ async def _try_push_task(task: Task, list_ms_id: str | None, action: str) -> boo
             task.sync_status = "synced"
             return True
         elif action == "update" and task.ms_id:
-            data = _task_to_graph_payload(task)
+            data = payload_override if payload_override is not None else _task_to_graph_payload(task)
             result = graph_client.update_task(list_ms_id, task.ms_id, data)
             if asyncio.iscoroutine(result):
                 result = await result
@@ -508,7 +537,12 @@ async def update_task(db: AsyncSession, task_id: uuid.UUID, data: TaskUpdate) ->
     list_result = await db.execute(select(TaskList).where(TaskList.id == task.list_id))
     task_list = list_result.scalar_one_or_none()
     list_ms_id = task_list.ms_id if task_list else None
-    await _try_push_task(task, list_ms_id, "update")
+    # ADR §3 (secondary): for recurring tasks, only include recurrence in the update PATCH
+    # if it was actually changed — otherwise Graph may 400 on a full-payload recurring PATCH.
+    update_payload = _task_to_graph_payload(task)
+    if task.recurrence and "recurrence" not in update_fields:
+        update_payload.pop("recurrence", None)
+    await _try_push_task(task, list_ms_id, "update", payload_override=update_payload)
     if checklist_touched:
         await _try_push_checklist_items(task, list_ms_id)
     await db.commit()
@@ -539,7 +573,11 @@ async def complete_task(db: AsyncSession, task_id: uuid.UUID) -> Task | None:
     list_result = await db.execute(select(TaskList).where(TaskList.id == task.list_id))
     task_list = list_result.scalar_one_or_none()
 
-    push_succeeded = await _try_push_task(task, task_list.ms_id if task_list else None, "update")
+    # ADR §3: completion-PATCH must be status-only (recurring full-payload PATCH → Graph 400).
+    push_succeeded = await _try_push_task(
+        task, task_list.ms_id if task_list else None, "update",
+        payload_override=_completion_patch_payload(task),
+    )
 
     # ADR §3: for recurring tasks, do NOT mark synced after immediate push even if it succeeded.
     # Graph auto-advances the series (A: same id flips to notStarted with new dueDateTime) and
@@ -570,7 +608,11 @@ async def uncomplete_task(db: AsyncSession, task_id: uuid.UUID) -> Task | None:
 
     list_result = await db.execute(select(TaskList).where(TaskList.id == task.list_id))
     task_list = list_result.scalar_one_or_none()
-    await _try_push_task(task, task_list.ms_id if task_list else None, "update")
+    # ADR §3: uncomplete-PATCH must also be status-only (same Graph-400 risk on recurring).
+    await _try_push_task(
+        task, task_list.ms_id if task_list else None, "update",
+        payload_override=_completion_patch_payload(task),
+    )
     await db.commit()
     await db.refresh(task)
     return task
