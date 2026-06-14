@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import async_session
 from app.models import LinkedResource, SyncLog, SyncState, Task, TaskAttachment, TaskList
 from app.services.graph_client import DeltaLinkExpiredError, graph_client
+from app.services.graph_id import is_present_id
 
 logger = logging.getLogger(__name__)
 
@@ -615,11 +616,24 @@ async def push_pending(db: AsyncSession) -> tuple[int, int]:
                     **({"externalId": lr.external_id} if lr.external_id else {}),
                 },
             )
-            lr.ms_id = resp.get("id")
-            lr.sync_status = "synced"
+            # RC-A/RC-B fix: verify Graph returned a real id before marking synced.
+            # linkedResource ids are GUIDs by design — use is_present_id (not is_task_graph_id).
+            gid = is_present_id(resp)
+            if gid:
+                lr.ms_id = gid
+                lr.sync_status = "synced"
+            else:
+                logger.error(
+                    "Graph returned 2xx for linked_resource %s but no id in response. "
+                    "Leaving status=pending for retry.", lr.id
+                )
+                lr.sync_status = "pending"
+                lr.ms_id = None
         except Exception:
+            # RC-B fix: use pending (not failed) so the push-loop retries on next sync.
+            # Terminal "failed" status makes the resource permanently stuck (loop only picks "pending").
             logger.exception("Failed to push linked_resource %s to Graph", lr.id)
-            lr.sync_status = "failed"
+            lr.sync_status = "pending"
 
     # F2.5: Push pending attachments (file attachments only; reference attachments are local-only)
     att_result = await db.execute(
@@ -650,11 +664,23 @@ async def push_pending(db: AsyncSession) -> tuple[int, int]:
                     "size": att.size_bytes or len(att.content_bytes),
                 },
             )
-            att.ms_id = resp.get("id")
-            att.sync_status = "synced"
+            # Align with is_present_id invariant: synced only after verifying a non-empty id.
+            # Attachment ids are base64 strings, but is_present_id (lenient) is correct here —
+            # we don't reject any particular id shape.
+            aid = is_present_id(resp)
+            if aid:
+                att.ms_id = aid
+                att.sync_status = "synced"
+            else:
+                logger.error(
+                    "Graph returned 2xx for attachment %s but no id in response. "
+                    "Leaving status=pending for retry.", att.id
+                )
+                att.sync_status = "pending"
+                att.ms_id = None
         except Exception:
             logger.exception("Failed to push attachment %s to Graph", att.id)
-            att.sync_status = "failed"
+            att.sync_status = "pending"
             # Continue with next attachment - failed attachment does not block others
 
     return pushed_lists, pushed_tasks
