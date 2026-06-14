@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import TaskAttachment
 from app.services.graph_client import graph_client
+from app.services.graph_id import is_present_id
 
 logger = logging.getLogger(__name__)
 
@@ -110,10 +111,22 @@ async def _try_push_to_graph(
                 "size": len(content),
             },
         )
-        att.ms_id = resp.get("id")
-        att.sync_status = "synced"
+        # Align with is_present_id invariant: synced only after verifying a non-empty id.
+        aid = is_present_id(resp)
+        if aid:
+            att.ms_id = aid
+            att.sync_status = "synced"
+        else:
+            logger.error(
+                "Graph returned 2xx for attachment (task=%s) but no id in response. "
+                "Leaving status=pending for retry.", task_id
+            )
+            att.sync_status = "pending"
+            att.ms_id = None
     except Exception:
         logger.exception("Failed to push attachment to Graph for task %s", task_id)
+        att.sync_status = "pending"
+        att.ms_id = None
 
 
 async def list_for_task(db: AsyncSession, task_id: uuid.UUID) -> list[TaskAttachment]:
