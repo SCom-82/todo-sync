@@ -597,3 +597,109 @@ class TestCompleteTaskSetsIntentMarker:
         assert task.sync_status == "synced"
         # Intent marker must NOT be set for non-recurring
         assert task.last_completed_occurrence_date is None
+
+
+# ─────────────────────────────────────────────
+# 5. Edge cases: weekly recurrence + no intent marker (dev-qa additions)
+# ─────────────────────────────────────────────
+
+WEEKLY_RECURRENCE = {
+    "pattern": {"type": "weekly", "interval": 1, "daysOfWeek": ["thursday"]},
+    "range": {"type": "noEnd", "startDate": "2026-06-12"},
+}
+
+
+class TestRecurringEdgeCases:
+    """Additional edge-case coverage identified during QA audit (2026-06-14)."""
+
+    @pytest.mark.asyncio
+    async def test_weekly_auto_advance_accepted(self):
+        """Weekly recurrence: completion 2026-06-12 (Thu) → series advances to 2026-06-19 (next Thu).
+        Pull sees notStarted + due 2026-06-19 > last_completed 2026-06-12 → auto-advance, not uncomplete.
+        """
+        existing = _make_existing_task(
+            ms_id="task-weekly-series",
+            status="completed",
+            sync_status="pending_push",
+            due_date=date(2026, 6, 12),
+            recurrence=WEEKLY_RECURRENCE,
+            last_completed_occurrence_date=date(2026, 6, 12),
+        )
+
+        graph_item = _graph_task_item(
+            ms_id="task-weekly-series",
+            status="notStarted",
+            due_date_str="2026-06-19",  # +7 days — weekly advance
+            modified_str="2026-06-12T15:00:00Z",
+            recurrence=WEEKLY_RECURRENCE,
+        )
+
+        existing_after, added = await _run_pull_tasks_for_list(existing, [graph_item])
+
+        assert existing_after.status == "notStarted"
+        assert existing_after.due_date == date(2026, 6, 19)
+        assert existing_after.sync_status == "synced"
+        assert existing_after.last_completed_occurrence_date is None
+        assert len(added) == 0
+
+    @pytest.mark.asyncio
+    async def test_auto_advance_without_intent_marker_falls_through(self):
+        """If last_completed_occurrence_date is None, no special guard fires.
+        Graph sends notStarted with shifted dueDate — falls through to normal setattr.
+        Result: status=notStarted accepted (no infinite guard loop). Non-blocking behaviour.
+        """
+        existing = _make_existing_task(
+            ms_id="task-no-intent",
+            status="completed",
+            sync_status="pending_push",
+            due_date=date(2026, 6, 14),
+            recurrence=DAILY_RECURRENCE,
+            last_completed_occurrence_date=None,  # no intent marker
+        )
+
+        graph_item = _graph_task_item(
+            ms_id="task-no-intent",
+            status="notStarted",
+            due_date_str="2026-06-15",
+            modified_str="2026-06-14T15:00:00Z",
+        )
+
+        existing_after, added = await _run_pull_tasks_for_list(existing, [graph_item])
+
+        # Without intent marker, the guard can't distinguish advance from uncomplete.
+        # The code falls through to the real uncomplete branch (completed_intent is None,
+        # so neither "if completed_intent and > " nor "elif completed_intent and <= " fires).
+        # Fall-through to full setattr: status = notStarted from Graph.
+        assert existing_after.status == "notStarted"
+        assert len(added) == 0
+
+    @pytest.mark.asyncio
+    async def test_sibling_same_title_not_deduped_with_series(self):
+        """Completed-sibling has same title as the series — must NOT collapse into series.
+        Dedup guard is only by ms_id. Two rows with same title are distinct tasks.
+        """
+        series_ms_id = "task-series-ms-id"
+        sibling_ms_id = "task-sibling-SAME-TITLE-ms-id"
+
+        sibling_item = {
+            "id": sibling_ms_id,
+            "title": "Daily standup",  # same title as series
+            "status": "completed",
+            "importance": "normal",
+            "isReminderOn": False,
+            "categories": [],
+            "lastModifiedDateTime": "2026-06-14T15:30:00Z",
+            "completedDateTime": {"dateTime": "2026-06-14T14:00:00Z", "timeZone": "UTC"},
+            "dueDateTime": {"dateTime": "2026-06-14T07:00:00Z", "timeZone": "UTC"},
+            "recurrence": DAILY_RECURRENCE,
+        }
+
+        # No existing task with this ms_id → new row created
+        _, added = await _run_pull_new_task([sibling_item])
+
+        assert len(added) >= 1
+        new_task = added[0]
+        # Must have the SIBLING ms_id, not any series-level id
+        assert new_task.ms_id == sibling_ms_id
+        # Must be completed
+        assert new_task.sync_status == "synced"
