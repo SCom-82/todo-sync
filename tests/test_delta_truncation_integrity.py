@@ -10,6 +10,10 @@ Covered scenarios:
   C-SMOKE-2: Clean round → delta_link advanced, success status, no errors
   C-SMOKE-3: _extract_prefix_items correctly extracts valid prefix from truncated body
   C-SMOKE-4: _extract_prefix_items returns [] on empty / totally broken body
+  C-SMOKE-5: Multi-page truncation (prod scenario КС-Финансы/Семья):
+             page 1 valid with nextLink, page 2 truncated → sync_service.pull_tasks_for_list
+             yields partial status, delta_link not advanced, errors≥1, prefix rescued.
+             Mutation guard: removing result={} or break in truncation branch breaks this test.
 
 Run: pytest tests/test_delta_truncation_integrity.py -v
 """
@@ -126,6 +130,13 @@ class TestDeltaTruncationIntegrity:
                 f"Prefix task {t['id']} should be in value, got {rescued_ids!r}"
             )
 
+        # Retry exhaustion: _request must have tried exactly MAX_RETRIES=3 times
+        # (all attempts return the same truncated body, so 3 HTTP calls are made
+        #  before raising — confirming retry logic runs fully before truncation-rescue).
+        assert mock_req.call_count == 3, (
+            f"Expected exactly 3 retries (MAX_RETRIES) on truncated body, got {mock_req.call_count}"
+        )
+
     @pytest.mark.asyncio
     async def test_clean_round_advances_delta_link(self):
         """C-SMOKE-2: Clean single-page round advances delta_link and reports success."""
@@ -210,3 +221,180 @@ class TestExtractPrefixItems:
         full = json.dumps({"value": tasks, "@odata.deltaLink": DELTA_TOKEN})
         result = _extract_prefix_items(full)
         assert len(result) == len(tasks)
+
+
+# ─────────────────────────────────────────────
+# C-SMOKE-5: Multi-page truncation — exact prod scenario (ADR 0003 §C-7-bis)
+#
+# Mocks at HTTP boundary (httpx.AsyncClient.request).
+# Calls real sync_service.pull_tasks_for_list (the SUT).
+# Validates all four invariants required by ADR 0003 §C-7:
+#   1. Tasks from page 1 are ingested (db.add called for each page-1 task)
+#   2. Prefix tasks from truncated page 2 are rescued (rescued_items > 0 path exercised)
+#   3. state.delta_link NOT advanced (remains as set before the call)
+#   4. state.last_sync_status == "partial"
+#   5. state.last_sync_errors incremented (>= 1)
+#
+# Mutation guard target:
+#   - Remove `result = {}` (line ~339 graph_client.py) → delta_link would be set from
+#     broken result dict → state.delta_link gets advanced → assertion (3) fails.
+#   - Remove `break` in truncation branch → pagination loop would continue on a consumed
+#     URL (no nextLink from broken page) → infinite loop or wrong result structure →
+#     assertion (4) or (5) fails.
+# ─────────────────────────────────────────────
+
+NEXT_LINK_P1 = "https://graph.microsoft.com/v1.0/me/todo/lists/.../tasks/delta?$skiptoken=PAGE2"
+PREV_DELTA_LINK = "https://graph.microsoft.com/v1.0/me/todo/lists/.../tasks/delta?$deltatoken=PREV"
+
+
+class TestMultiPageTruncationProdScenario:
+    """C-SMOKE-5: Multi-page abort — the exact КС-Финансы/Семья production pattern.
+
+    Page 1: valid delta response with @odata.nextLink (3 tasks, no deltaLink yet).
+    Page 2: truncated body (2-task prefix, then cut off — Graph InternalServerError pattern).
+
+    pull_tasks_for_list is called on the real sync_service, with:
+      - httpx.AsyncClient.request mocked at the HTTP boundary
+      - _get_or_create_sync_state mocked to return a controllable state object
+      - db mocked as AsyncMock (scalar_one_or_none → None so tasks are treated as new)
+      - graph_client sub-calls (checklist, linked_resources, attachments) mocked to [] / {}
+    """
+
+    def _make_state(self, existing_delta_link: str | None = PREV_DELTA_LINK):
+        """Build a plain namespace that behaves like SyncState for attribute reads/writes."""
+        state = MagicMock()
+        state.delta_link = existing_delta_link
+        state.last_sync_status = "success"
+        state.last_sync_errors = 0
+        state.last_sync_at = None
+        state.delta_syncs_total = 0
+        state.delta_syncs_succeeded = 0
+        state.delta_full_resets_total = 0
+        return state
+
+    def _make_db(self):
+        """AsyncMock DB session: execute returns a result where scalar_one_or_none → None.
+
+        None means 'task does not exist locally' so pull_tasks_for_list will create a new
+        Task via db.add() for each ingested item — allowing us to verify ingestion by
+        counting db.add calls.
+        """
+        db = AsyncMock()
+        db.flush = AsyncMock()
+        db.add = MagicMock()   # sync call in the real code (not awaited)
+        db.delete = AsyncMock()
+
+        # db.execute returns an object whose .scalar_one_or_none() returns None (new task)
+        # and whose .scalars().all() returns [] (no existing attachments/linked_resources)
+        mock_result = MagicMock()
+        mock_result.scalar_one_or_none.return_value = None
+        mock_scalars = MagicMock()
+        mock_scalars.all.return_value = []
+        mock_result.scalars.return_value = mock_scalars
+        db.execute = AsyncMock(return_value=mock_result)
+        return db
+
+    @pytest.mark.asyncio
+    async def test_multi_page_truncation_on_page2(self):
+        """C-SMOKE-5 (ADR 0003 §C-7-bis): page-1 valid + page-2 truncated.
+
+        Verifies that pull_tasks_for_list:
+          - ingests page-1 tasks (db.add called N times for page-1 items)
+          - rescues page-2 prefix tasks (also ingested via db.add)
+          - does NOT advance state.delta_link (remains PREV_DELTA_LINK)
+          - sets state.last_sync_status = "partial"
+          - increments state.last_sync_errors to >= 1
+
+        Mutation guard: removing `result = {}` or `break` in graph_client.py truncation
+        branch will break this test (delta_link would be advanced or status would be wrong).
+        """
+        from app.services import sync_service
+
+        # Page 1: 3 tasks, valid, has nextLink (not yet final page)
+        page1_tasks = [_task_json(i) for i in range(1, 4)]
+        body_p1 = _full_delta_body(page1_tasks, next_link=NEXT_LINK_P1)
+
+        # Page 2: 2-task prefix then truncation (no deltaLink visible)
+        page2_prefix_tasks = [_task_json(i) for i in range(4, 6)]
+        body_p2_truncated = _truncated_delta_body(page2_prefix_tasks)
+
+        # task_list mock
+        task_list = MagicMock()
+        task_list.id = "local-list-uuid-001"
+        task_list.ms_id = LIST_MS_ID
+
+        state = self._make_state(existing_delta_link=PREV_DELTA_LINK)
+        db = self._make_db()
+
+        # HTTP call sequence: page 1 (1 call) → page 2 (3 retries with same truncated body)
+        # Total expected = 4 calls. If `break` is mutated away, the loop continues forever
+        # making repeated calls to page-2 URL. We cap at MAX_CALLS to make the test FAIL
+        # (not hang) on that mutation.
+        MAX_CALLS = 10
+        http_call_count = 0
+
+        async def http_side_effect(method, url, **kwargs):
+            nonlocal http_call_count
+            http_call_count += 1
+            if http_call_count > MAX_CALLS:
+                raise RuntimeError(
+                    f"HTTP mock exceeded {MAX_CALLS} calls — likely infinite loop due to "
+                    "missing `break` in truncation branch (mutation guard)"
+                )
+            if http_call_count == 1:
+                return _make_response(body_p1)
+            # Calls 2, 3, 4 (= 3 retries of page 2) all return the same truncated body
+            return _make_response(body_p2_truncated)
+
+        with patch("httpx.AsyncClient.request", side_effect=http_side_effect) as mock_req:
+            with patch("app.services.graph_client.auth_service.get_access_token", new_callable=AsyncMock) as mock_auth:
+                mock_auth.return_value = "fake-token"
+                with patch.object(sync_service, "_get_or_create_sync_state", new_callable=AsyncMock) as mock_get_state:
+                    mock_get_state.return_value = state
+                    # Sub-calls from pull_tasks_for_list after delta fetch:
+                    # get_checklist_items, list_linked_resources, list_attachments
+                    with patch.object(sync_service.graph_client, "get_checklist_items", new_callable=AsyncMock) as mock_cl, \
+                         patch.object(sync_service.graph_client, "list_linked_resources", new_callable=AsyncMock) as mock_lr, \
+                         patch.object(sync_service.graph_client, "list_attachments", new_callable=AsyncMock) as mock_att:
+                        mock_cl.return_value = []
+                        mock_lr.return_value = []
+                        mock_att.return_value = []
+
+                        upserted, deleted = await sync_service.pull_tasks_for_list(db, task_list)
+
+        # ── 1. Tasks from page 1 are ingested ──
+        # All page-1 and rescued page-2 prefix tasks should be new (existing=None),
+        # so pull_tasks_for_list calls db.add() once per ingested task.
+        total_ingested = len(page1_tasks) + len(page2_prefix_tasks)
+        assert db.add.call_count == total_ingested, (
+            f"Expected db.add called {total_ingested} times (page1={len(page1_tasks)} + "
+            f"rescued={len(page2_prefix_tasks)}), got {db.add.call_count}"
+        )
+        assert upserted == total_ingested, (
+            f"upserted counter must equal {total_ingested}, got {upserted}"
+        )
+
+        # ── 2. Prefix tasks from page 2 are rescued ──
+        # Covered by db.add.call_count check above (prefix tasks are in the ingested set).
+        # Additionally verify that the rescue path was exercised via HTTP call count:
+        # 1 (page 1) + 3 (page 2 retries, MAX_RETRIES=3) = 4 total HTTP calls
+        assert mock_req.call_count == 4, (
+            f"Expected 4 HTTP calls (1 page-1 + 3 retries page-2), got {mock_req.call_count}"
+        )
+
+        # ── 3. state.delta_link NOT advanced ──
+        # Must remain as it was before the call (PREV_DELTA_LINK), not updated to any new token.
+        assert state.delta_link == PREV_DELTA_LINK, (
+            f"delta_link must NOT be advanced on truncated round; "
+            f"expected {PREV_DELTA_LINK!r}, got {state.delta_link!r}"
+        )
+
+        # ── 4. state.last_sync_status == "partial" ──
+        assert state.last_sync_status == "partial", (
+            f"last_sync_status must be 'partial' after truncated round, got {state.last_sync_status!r}"
+        )
+
+        # ── 5. state.last_sync_errors incremented ──
+        assert state.last_sync_errors >= 1, (
+            f"last_sync_errors must be >= 1 after truncated round, got {state.last_sync_errors}"
+        )
