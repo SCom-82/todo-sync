@@ -439,9 +439,31 @@ async def pull_tasks_for_list(db: AsyncSession, task_list: TaskList) -> tuple[in
             if ms_id not in remote_att_ids:
                 await db.delete(att)
 
-    state.delta_link = delta_result.get("delta_link")
-    state.last_sync_at = datetime.now(timezone.utc)
-    state.last_sync_status = "success"
+    # ADR 0003 §C-7: Defensive delta-link advancement.
+    # Only advance the delta cursor if the round completed WITHOUT truncation.
+    # A truncated round means Graph emitted an InternalServerError inside a 200 OK body,
+    # closing the stream before the nextLink/deltaLink was serialized. Advancing delta_link
+    # in this case would permanently lose all tasks on pages after the truncation point.
+    if delta_result.get("truncated"):
+        truncated_pages = delta_result.get("truncated_pages", 1)
+        rescued = delta_result.get("rescued_items", 0)
+        logger.error(
+            "pull_tasks_for_list: delta round PARTIAL for list %s — "
+            "%d page(s) truncated by Graph (InternalServerError in body). "
+            "delta_link NOT advanced. Rescued %d prefix items. "
+            "ACTION REQUIRED: identify and repair the corrupted task (ADR 0003 §C-7-bis data-fix). "
+            "upserted=%d deleted=%d",
+            task_list.ms_id, truncated_pages, rescued, upserted, deleted,
+        )
+        # Do NOT update state.delta_link — keep the previous token so next cycle retries.
+        state.last_sync_at = datetime.now(timezone.utc)
+        state.last_sync_status = "partial"
+        # Increment error counter so monitoring/alerts can detect the condition.
+        state.last_sync_errors = (state.last_sync_errors or 0) + truncated_pages
+    else:
+        state.delta_link = delta_result.get("delta_link")
+        state.last_sync_at = datetime.now(timezone.utc)
+        state.last_sync_status = "success"
 
     return upserted, deleted
 
