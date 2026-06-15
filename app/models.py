@@ -120,6 +120,9 @@ class SyncState(Base):
     delta_syncs_total: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0", default=0)
     delta_syncs_succeeded: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0", default=0)
     delta_full_resets_total: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0", default=0)
+    # ADR 0003 §C-7: cumulative count of delta pages that could not be parsed (Graph truncation errors).
+    # Non-zero means at least one partial round occurred; used by monitoring to detect silent data loss.
+    last_sync_errors: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0", default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()

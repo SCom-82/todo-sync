@@ -39,6 +39,55 @@ def _try_parse_truncated_json(text: str) -> dict | None:
     return None
 
 
+def _extract_prefix_items(text: str) -> list:
+    """Extract the valid prefix of the 'value' array from a truncated Graph delta response.
+
+    Graph delta pages have the shape: {"value": [{...}, {...}, ...], "@odata.nextLink": "..."}
+    When Graph truncates the body mid-serialization (server-side serialization bug), the
+    'value' array is left open. This function extracts all fully-serialized items before
+    the truncation point.
+
+    Returns a (possibly empty) list of dicts — the items that successfully serialized.
+    Does NOT return None on failure; returns [] instead, so callers can ingest the prefix
+    and still mark the round as partial.
+    """
+    # Locate the start of the "value" array
+    value_key = '"value"'
+    key_pos = text.find(value_key)
+    if key_pos == -1:
+        return []
+    # Find the opening '[' of the array
+    array_start = text.find("[", key_pos + len(value_key))
+    if array_start == -1:
+        return []
+
+    items = []
+    pos = array_start + 1
+    decoder = json.JSONDecoder()
+
+    # Skip whitespace and commas, then try to decode individual JSON objects
+    while pos < len(text):
+        # Skip whitespace and commas between items
+        while pos < len(text) and text[pos] in " \t\n\r,":
+            pos += 1
+        if pos >= len(text):
+            break
+        # End of array (clean close)
+        if text[pos] == "]":
+            break
+        # Try to parse next object
+        try:
+            obj, end_idx = decoder.raw_decode(text, pos)
+            if isinstance(obj, dict):
+                items.append(obj)
+            pos = end_idx
+        except json.JSONDecodeError:
+            # Can't parse further — truncation point reached
+            break
+
+    return items
+
+
 class MSGraphToDoClient:
     def __init__(self) -> None:
         self._client: httpx.AsyncClient | None = None
@@ -200,27 +249,102 @@ class MSGraphToDoClient:
         )
 
     async def get_tasks_delta(self, list_ms_id: str, delta_link: str | None = None) -> dict:
+        """Fetch all delta pages for a task list.
+
+        Returns a dict with keys:
+          - "value": list of task dicts ingested so far
+          - "delta_link": finalised delta token (None if round is partial/failed)
+          - "truncated": True if at least one page failed to parse (partial round)
+          - "truncated_pages": count of pages that could not be parsed
+          - "rescued_items": count of items extracted from truncated pages via prefix-parse
+
+        Defensive invariant (ADR 0003 §C-7):
+          - If any page fails JSON parsing, the round is marked as partial (truncated=True).
+          - delta_link is set to None so callers do NOT advance the delta cursor.
+          - Items successfully serialized before the truncation point are rescued via
+            _extract_prefix_items and included in "value".
+          - prev_next_link (the nextLink from the last successful page) is stored so
+            diagnostics can identify where the round broke.
+          - "Partial result == success" is explicitly forbidden: callers MUST check
+            "truncated" and set last_sync_status accordingly.
+        """
         url = delta_link or f"{BASE_URL}/lists/{list_ms_id}/tasks/delta"
-        all_values = []
-        result = {}
-        skipped_pages = 0
+        all_values: list = []
+        result: dict = {}
+        truncated_pages = 0
+        rescued_items = 0
+        # Stores the nextLink from the last successfully parsed page.
+        # On truncation, this is the URL we would need to resume from (hard-stop case).
+        # TODO: resumption from prev_next_link is not yet implemented; stored for diagnostics only.
+        prev_next_link: str | None = None
+
         while url:
             try:
                 result = await self._request("GET", url)
                 all_values.extend(result.get("value", []))
-                url = result.get("@odata.nextLink")
-            except (json.JSONDecodeError, Exception) as e:
-                if "JSONDecodeError" in type(e).__name__ or "JSON" in str(e):
-                    logger.warning("Skipping unparseable delta page for list %s: %s", list_ms_id, e)
-                    skipped_pages += 1
-                    # Can't get nextLink from broken response, stop pagination
-                    break
-                raise
-        if skipped_pages:
-            logger.warning("Delta sync for list %s: skipped %d pages, got %d items", list_ms_id, skipped_pages, len(all_values))
+                next_link = result.get("@odata.nextLink")
+                if next_link:
+                    prev_next_link = url  # the page we just successfully fetched
+                url = next_link
+            except Exception as e:
+                is_json_error = (
+                    isinstance(e, json.JSONDecodeError)
+                    or "JSONDecodeError" in type(e).__name__
+                    or "JSON" in str(e)
+                )
+                if not is_json_error:
+                    raise
+
+                # --- Truncated page handling (ADR 0003 §C-7 revised) ---
+                # Graph emitted an InternalServerError inside a 200 OK body for a task
+                # with a corrupted linkedResources navigation property, then closed the
+                # HTTP stream without completing the JSON. We cannot get the nextLink from
+                # this body (Fact 2: hard-stop confirmed by battle-test §C-7-bis).
+
+                # Attempt partial-parse: salvage items that Graph serialized before the error.
+                raw_text = getattr(e, "doc", None)
+                if raw_text is None:
+                    # JSONDecodeError stores the partial doc in .doc; fall back to re-reading
+                    # the response body from the exception args if available.
+                    try:
+                        raw_text = e.args[0] if e.args else ""
+                    except Exception:
+                        raw_text = ""
+
+                # _request already decoded bytes→str for us; re-decode if we got bytes
+                if isinstance(raw_text, (bytes, bytearray)):
+                    raw_text = raw_text.decode("utf-8", errors="replace")
+
+                rescued = _extract_prefix_items(raw_text or "")
+                if rescued:
+                    logger.error(
+                        "Delta page truncated for list %s — rescued %d prefix items from broken page "
+                        "(Graph InternalServerError in body, ADR 0003 §C-7). "
+                        "prev_next_link=%s",
+                        list_ms_id, len(rescued), prev_next_link,
+                    )
+                    all_values.extend(rescued)
+                    rescued_items += len(rescued)
+                else:
+                    logger.error(
+                        "Delta page truncated for list %s — could not rescue any items from broken page "
+                        "(Graph InternalServerError in body, ADR 0003 §C-7). "
+                        "prev_next_link=%s",
+                        list_ms_id, prev_next_link,
+                    )
+
+                truncated_pages += 1
+                # Hard-stop: cannot continue pagination, nextLink is past the truncation point.
+                # delta_link will be None (not advanced) — caller must NOT mark round as success.
+                result = {}  # no delta_link available from this broken response
+                break
+
         return {
             "value": all_values,
-            "delta_link": result.get("@odata.deltaLink") if result else None,
+            "delta_link": result.get("@odata.deltaLink") if result and not truncated_pages else None,
+            "truncated": truncated_pages > 0,
+            "truncated_pages": truncated_pages,
+            "rescued_items": rescued_items,
         }
 
 
