@@ -115,8 +115,28 @@ class TestSyncLinkedResourcesPull:
 class TestSyncLinkedResourcesPush:
     @pytest.mark.asyncio
     async def test_push_pending_creates_in_graph(self):
-        """Pending linked_resources are pushed to Graph and marked synced."""
-        from app.services import sync_service
+        """Smoke: graph_client.create_linked_resource method exists and is callable.
+
+        NOTE: Full contract tests (T1-T8) live in test_f2_1_linked_resource_push.py.
+        The original version of this test was tautological (RC-C in ADR 0001): it called
+        the mock directly instead of the SUT, asserting only that the mock returned what
+        it was configured to return. Replaced with a minimal sanity check.
+        """
+        from app.services.graph_client import graph_client as gc
+        assert hasattr(gc, "create_linked_resource")
+        assert callable(gc.create_linked_resource)
+
+    @pytest.mark.asyncio
+    async def test_push_failure_stays_pending_not_failed(self):
+        """RC-B regression: on Graph error, linked_resource stays pending (not failed).
+
+        push-loop only retries 'pending' status; 'failed' would make the resource permanently
+        stuck. This is a guard that the push-loop in sync_service sets pending on exception.
+        Full contract test: T7 in test_f2_1_linked_resource_push.py.
+        """
+        from app.services.sync_service import push_pending as _push_pending
+        from app.models import LinkedResource, Task, TaskList
+        import httpx
 
         lr = MagicMock(spec=LinkedResource)
         lr.id = uuid.uuid4()
@@ -124,43 +144,47 @@ class TestSyncLinkedResourcesPush:
         lr.ms_id = None
         lr.web_url = "https://github.com/pr/1"
         lr.display_name = "PR #1"
-        lr.application_name = "GitHub"
+        lr.application_name = None
         lr.external_id = None
         lr.sync_status = "pending"
 
         task = _make_task()
         task_list = _make_task_list()
 
-        graph_resp = {"id": "graph-lr-new-id"}
+        lr_scalars = MagicMock()
+        lr_scalars.scalars.return_value.all.return_value = [lr]
 
-        with patch.object(sync_service.graph_client, "create_linked_resource", return_value=graph_resp) as mock_push:
-            # Verify the method exists and can be called
-            result = await sync_service.graph_client.create_linked_resource(
-                task_list.ms_id, task.ms_id,
-                {"webUrl": lr.web_url, "displayName": lr.display_name, "applicationName": lr.application_name},
-            )
-            assert result["id"] == "graph-lr-new-id"
-            mock_push.assert_called_once()
+        task_scalar = MagicMock()
+        task_scalar.scalar_one_or_none.return_value = task
 
-    @pytest.mark.asyncio
-    async def test_push_failure_marks_failed_not_blocking(self):
-        """If push fails for one linked_resource, it's marked failed, others continue."""
-        from app.services import sync_service
+        list_scalar = MagicMock()
+        list_scalar.scalar_one_or_none.return_value = task_list
 
-        # Simulate two linked resources, first fails
-        call_count = [0]
-        async def side_effect(*args, **kwargs):
-            call_count[0] += 1
-            if call_count[0] == 1:
-                raise RuntimeError("Graph API error")
-            return {"id": "lr-success"}
+        empty_scalars = MagicMock()
+        empty_scalars.scalars.return_value.all.return_value = []
 
-        with patch.object(sync_service.graph_client, "create_linked_resource", side_effect=side_effect):
-            with pytest.raises(RuntimeError):
-                await sync_service.graph_client.create_linked_resource("list", "task", {})
-            # Second call succeeds
-            result = await sync_service.graph_client.create_linked_resource("list", "task2", {})
-            assert result["id"] == "lr-success"
+        db = AsyncMock()
+        db.commit = AsyncMock()
+        db.execute = AsyncMock(side_effect=[
+            empty_scalars, empty_scalars, empty_scalars, empty_scalars,
+            lr_scalars, task_scalar, list_scalar,
+            empty_scalars,
+        ])
+
+        mock_response = MagicMock()
+        mock_response.status_code = 503
+
+        async def failing_request(method, url, json_body=None, params=None):
+            raise httpx.HTTPStatusError("503 Service Unavailable", request=MagicMock(), response=mock_response)
+
+        from app.services.graph_client import graph_client
+        with patch.object(graph_client, "_request", side_effect=failing_request):
+            await _push_pending(db)
+
+        assert lr.sync_status == "pending", (
+            f"RC-B regression: push-loop set '{lr.sync_status}' on error. "
+            f"Must be 'pending' to allow retry."
+        )
 
 
 # ─────────────────────────────────────────────

@@ -365,19 +365,13 @@ async def get_task(db: AsyncSession, task_id: uuid.UUID) -> Task | None:
 
 
 def _validate_graph_id(resp: dict) -> str | None:
-    """Return Graph id from response if it looks like a valid Graph base64 id, else None.
+    """Return Graph id from response if it looks like a valid Graph Task base64 id.
 
-    Graph IDs are base64-encoded strings, typically 100+ chars. Local UUIDs (36 chars with dashes)
-    indicate the push silently failed and the response did not return a real Graph id.
+    Delegates to graph_id.is_task_graph_id — single source of truth.
+    Kept here as private alias so existing callers inside task_service are not changed.
     """
-    id_val = resp.get("id")
-    if not id_val or not isinstance(id_val, str):
-        return None
-    # UUID4 format = 8-4-4-4-12 hex with dashes (36 chars). Graph IDs are much longer.
-    import re as _re
-    if _re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", id_val, _re.IGNORECASE):
-        return None  # local UUID, not a real Graph id
-    return id_val
+    from app.services.graph_id import is_task_graph_id
+    return is_task_graph_id(resp)
 
 
 async def _try_push_task(
