@@ -71,9 +71,12 @@ async def create_reference(
     # F3.5: mark task as having attachments
     await _set_task_has_attachments(db, task_id, True)
 
-    # Reference attachments are stored locally only (Graph supports file attachments via upload session)
-    # For now mark as synced since we don't push reference attachments to Graph
-    att.sync_status = "synced"
+    # ADR 0003 §B-4: Reference (URL) attachments are local-only records.
+    # Graph todoTask attachments only support file content (contentBytes) — there is no
+    # "reference attachment" type in Graph.  We do NOT push this to Graph and must NOT
+    # lie that it is synced.  Status stays "pending" so callers know it has not reached Graph.
+    # The recommended path for URL sharing is linkedResource (see attach_url endpoint).
+    # att.sync_status remains "pending" as set at construction — no override needed.
 
     await db.commit()
     await db.refresh(att)
