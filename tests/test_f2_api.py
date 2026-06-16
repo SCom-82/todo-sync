@@ -284,8 +284,9 @@ class TestAttachmentSizeValidation:
                     name="Google Drive file",
                 )
 
-        # Reference attachments get synced=True (local-only, no Graph push)
-        assert att_instance.sync_status == "synced"
+        # ADR 0003 §B-4: create_reference is local-only, no Graph push happens.
+        # sync_status must remain "pending" — NOT "synced" (that was the bug).
+        assert att_instance.sync_status == "pending"
         db.add.assert_called_once()
 
     @pytest.mark.asyncio

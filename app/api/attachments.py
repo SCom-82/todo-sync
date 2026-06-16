@@ -7,8 +7,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.models import Task, TaskAttachment, MAX_ATTACHMENT_BYTES
-from app.schemas import AttachmentOut, AttachmentContentOut
-from app.services import attachment_service
+from app.schemas import AttachmentOut, AttachmentContentOut, LinkedResourceIn, LinkedResourceOut
+from app.services import attachment_service, linked_resource_service
 
 router = APIRouter(tags=["attachments"])
 
@@ -45,25 +45,32 @@ async def upload_attachment(
     return att
 
 
-@router.post("/tasks/{task_id}/attachments/url", response_model=AttachmentOut, status_code=201)
+@router.post("/tasks/{task_id}/attachments/url", response_model=LinkedResourceOut, status_code=201)
 async def attach_url(
     task_id: uuid.UUID,
     url: str,
     name: str | None = None,
     db: AsyncSession = Depends(get_db),
 ):
-    """Attach a URL reference (no file content stored)."""
+    """Attach a URL by creating a linkedResource (pushes to Microsoft Graph).
+
+    ADR 0003 §B-4 fix: Graph todoTask attachments only support file content (contentBytes).
+    URL references must go through linkedResources, which is the correct Graph mechanism
+    and produces a visible link in the MS To Do task details view.
+
+    Response shape changed from AttachmentOut to LinkedResourceOut (same HTTP 201 status).
+    """
     task = await db.get(Task, task_id)
     if not task or task.deleted_at:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    att = await attachment_service.create_reference(
-        db,
-        task_id=task_id,
-        url=url,
-        name=name or url,
+    data = LinkedResourceIn(
+        web_url=url,
+        display_name=name or url,
+        application_name="todo-sync",
     )
-    return att
+    lr = await linked_resource_service.create(db, task_id, data)
+    return lr
 
 
 @router.get("/tasks/{task_id}/attachments", response_model=list[AttachmentOut])
